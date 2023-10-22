@@ -11,25 +11,32 @@ use {
     },
 };
 
+/// A shared value that can be read on the real-time thread without blocking.
 pub struct RealtimeReader<T> {
     shared: Arc<Shared<T>>,
     _marker: PhantomData<Cell<()>>,
 }
 
+/// A shared value that can be mutated on a non-real-time thread.
 pub struct LockingWriter<T> {
     shared: Mutex<Arc<Shared<T>>>,
 }
 
+/// A guard that allows reading the shared value on the real-time thread.
 pub struct RealtimeReadGuard<'a, T> {
     shared: &'a Shared<T>,
     value: *mut T,
 }
 
+/// A guard that allows mutating the shared value on a non-real-time thread.
+///
+/// The updated value will only be observed by the real-time thread after the guard is dropped.
 pub struct LockingWriteGuard<'a, T> {
     shared: MutexGuard<'a, Arc<Shared<T>>>,
     value: Option<T>,
 }
 
+/// Creates a shared value that can be read on the real-time thread without blocking.
 pub fn realtime_reader<T>(value: T) -> (LockingWriter<T>, RealtimeReader<T>) {
     let value = Box::into_raw(Box::new(value));
 
@@ -44,7 +51,7 @@ pub fn realtime_reader<T>(value: T) -> (LockingWriter<T>, RealtimeReader<T>) {
         },
         RealtimeReader {
             shared,
-            _marker: PhantomData::default(),
+            _marker: PhantomData,
         },
     )
 }
@@ -65,6 +72,7 @@ impl<T> Drop for Shared<T> {
 }
 
 impl<T> RealtimeReader<T> {
+    /// Read the shared value on the real-time thread.
     pub fn read(&self) -> RealtimeReadGuard<'_, T> {
         let value = self.shared.live.swap(null_mut(), Ordering::SeqCst);
         assert_ne!(value, null_mut());
@@ -86,6 +94,7 @@ impl<T> Deref for RealtimeReadGuard<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
+        // SAFETY: `self.value` is a valid pointer for the lifetime of `self`.
         unsafe { &*self.value }
     }
 }
@@ -94,12 +103,13 @@ impl<T> LockingWriter<T>
 where
     T: Clone,
 {
+    /// Mutate the shared value on a non-real-time thread.
     pub fn write(&self) -> LockingWriteGuard<'_, T> {
         let shared = self.shared.lock().unwrap();
 
         let value_ptr = shared.storage.load(Ordering::Relaxed);
-        assert_ne!(value_ptr, null_mut());
 
+        assert_ne!(value_ptr, null_mut());
         let value = unsafe { &*value_ptr };
 
         LockingWriteGuard {
@@ -112,25 +122,22 @@ where
 impl<T> Drop for LockingWriteGuard<'_, T> {
     fn drop(&mut self) {
         let old = self.shared.storage.load(Ordering::Acquire);
+
         let new = Box::into_raw(Box::new(self.value.take().expect("value taken twice")));
-
-        loop {
-            if self
-                .shared
-                .live
-                .compare_exchange_weak(old, new, Ordering::SeqCst, Ordering::Relaxed)
-                .is_ok()
-            {
-                break;
-            }
-
+        while self
+            .shared
+            .live
+            .compare_exchange_weak(old, new, Ordering::SeqCst, Ordering::Relaxed)
+            .is_err()
+        {
             #[cfg(loom)]
             loom::thread::yield_now();
         }
+        assert_ne!(old, null_mut());
 
         self.shared.storage.store(new, Ordering::Release);
 
-        assert_ne!(old, null_mut());
+        // SAFETY: No other references to `old` exist, so it's safe to drop.
         let _ = unsafe { Box::from_raw(old) };
     }
 }
@@ -172,10 +179,12 @@ mod test {
 
         let writers = (0..10)
             .map(|_| {
-                let writer = Arc::clone(&writer);
-                thread::spawn(move || {
-                    for _ in 0..100 {
-                        *writer.write() += 1;
+                thread::spawn({
+                    let writer = Arc::clone(&writer);
+                    move || {
+                        for _ in 0..100 {
+                            *writer.write() += 1;
+                        }
                     }
                 })
             })

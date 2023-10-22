@@ -2,7 +2,7 @@
 
 use {
     loom::{sync::Arc, thread},
-    rtobj::reader::realtime_reader,
+    real_time::reader::realtime_reader,
 };
 
 #[test]
