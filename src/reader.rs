@@ -1,10 +1,12 @@
 use {
-    crate::sync::{
-        atomic::{AtomicPtr, Ordering},
-        Arc, Mutex, MutexGuard,
+    crate::{
+        sync::{
+            atomic::{AtomicPtr, Ordering},
+            Arc, Mutex, MutexGuard,
+        },
+        PhantomUnsync,
     },
     std::{
-        cell::Cell,
         marker::PhantomData,
         ops::{Deref, DerefMut},
         ptr::null_mut,
@@ -14,7 +16,7 @@ use {
 /// A shared value that can be read on the real-time thread without blocking.
 pub struct RealtimeReader<T> {
     shared: Arc<Shared<T>>,
-    _marker: PhantomData<Cell<()>>,
+    _marker: PhantomUnsync,
 }
 
 /// A shared value that can be mutated on a non-real-time thread.
@@ -73,7 +75,7 @@ impl<T> Drop for Shared<T> {
 
 impl<T> RealtimeReader<T> {
     /// Read the shared value on the real-time thread.
-    pub fn read(&self) -> RealtimeReadGuard<'_, T> {
+    pub fn read(&mut self) -> RealtimeReadGuard<'_, T> {
         let value = self.shared.live.swap(null_mut(), Ordering::SeqCst);
         assert_ne!(value, null_mut());
 
@@ -122,6 +124,7 @@ where
 impl<T> Drop for LockingWriteGuard<'_, T> {
     fn drop(&mut self) {
         let old = self.shared.storage.load(Ordering::Acquire);
+        assert_ne!(old, null_mut());
 
         let new = Box::into_raw(Box::new(self.value.take().expect("value taken twice")));
         while self
@@ -133,7 +136,6 @@ impl<T> Drop for LockingWriteGuard<'_, T> {
             #[cfg(loom)]
             loom::thread::yield_now();
         }
-        assert_ne!(old, null_mut());
 
         self.shared.storage.store(new, Ordering::Release);
 
@@ -162,7 +164,7 @@ mod test {
 
     #[test]
     fn read_and_write_to_shared_value() {
-        let (writer, reader) = realtime_reader(0);
+        let (writer, mut reader) = realtime_reader(0);
 
         assert_eq!(*reader.read(), 0);
         *writer.write() += 1;
@@ -173,7 +175,7 @@ mod test {
 
     #[test]
     fn read_and_writing_simultaneously() {
-        let (writer, reader) = realtime_reader(0);
+        let (writer, mut reader) = realtime_reader(0);
 
         let writer = Arc::new(writer);
 
