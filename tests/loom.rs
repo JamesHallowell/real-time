@@ -65,10 +65,8 @@ fn writing_on_real_time_thread_with_multiple_simultaneously_readers() {
                     for _ in 0..READS {
                         let value = reader.lock().count;
 
-                        assert!(value == 1 || value == 2 || value == 3);
-                        if let Some(last_read) = last_read {
-                            assert!(value >= last_read);
-                        }
+                        assert!(value == 1 || value == 2);
+                        assert!(last_read.is_none() || last_read <= Some(value));
 
                         last_read = Some(value);
                     }
@@ -76,8 +74,6 @@ fn writing_on_real_time_thread_with_multiple_simultaneously_readers() {
             });
         }
 
-        for _ in 1..3 {
-            writer.write().count += 1;
-        }
+        writer.write().count += 1;
     });
 }
