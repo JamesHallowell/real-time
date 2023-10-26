@@ -63,6 +63,38 @@ struct Shared<T> {
     live: AtomicPtr<T>,
 }
 
+impl<T> Shared<T> {
+    fn load(&self) -> T
+    where
+        T: Clone,
+    {
+        let value = self.storage.load(Ordering::Relaxed);
+        assert_ne!(value, null_mut());
+
+        unsafe { &*value }.clone()
+    }
+
+    fn store(&self, value: T) {
+        let old = self.storage.load(Ordering::Acquire);
+        assert_ne!(old, null_mut());
+
+        let new = Box::into_raw(Box::new(value));
+        while self
+            .live
+            .compare_exchange_weak(old, new, Ordering::SeqCst, Ordering::Relaxed)
+            .is_err()
+        {
+            #[cfg(loom)]
+            loom::thread::yield_now();
+        }
+
+        self.storage.store(new, Ordering::Release);
+
+        // SAFETY: No other references to `old` exist, so it's safe to drop.
+        let _ = unsafe { Box::from_raw(old) };
+    }
+}
+
 impl<T> Drop for Shared<T> {
     fn drop(&mut self) {
         let ptr = self.storage.load(Ordering::Relaxed);
@@ -101,46 +133,38 @@ impl<T> Deref for RealtimeReadGuard<'_, T> {
     }
 }
 
-impl<T> LockingWriter<T>
-where
-    T: Clone,
-{
+impl<T> LockingWriter<T> {
+    /// Set the value.
+    pub fn set(&self, value: T) {
+        self.shared.lock().unwrap().store(value);
+    }
+
+    /// Update the value.
+    pub fn update<R>(&self, mut updater: impl FnMut(&mut T) -> R) -> R
+    where
+        T: Clone,
+    {
+        let mut writer = self.write();
+        updater(&mut *writer)
+    }
+
     /// Mutate the shared value on a non-real-time thread.
-    pub fn write(&self) -> LockingWriteGuard<'_, T> {
+    pub fn write(&self) -> LockingWriteGuard<'_, T>
+    where
+        T: Clone,
+    {
         let shared = self.shared.lock().unwrap();
 
-        let value_ptr = shared.storage.load(Ordering::Relaxed);
-
-        assert_ne!(value_ptr, null_mut());
-        let value = unsafe { &*value_ptr };
-
-        LockingWriteGuard {
-            shared,
-            value: Some(value.clone()),
-        }
+        let value = Some(shared.load());
+        LockingWriteGuard { shared, value }
     }
 }
 
 impl<T> Drop for LockingWriteGuard<'_, T> {
     fn drop(&mut self) {
-        let old = self.shared.storage.load(Ordering::Acquire);
-        assert_ne!(old, null_mut());
-
-        let new = Box::into_raw(Box::new(self.value.take().expect("value taken twice")));
-        while self
-            .shared
-            .live
-            .compare_exchange_weak(old, new, Ordering::SeqCst, Ordering::Relaxed)
-            .is_err()
-        {
-            #[cfg(loom)]
-            loom::thread::yield_now();
+        if let Some(value) = self.value.take() {
+            self.shared.store(value);
         }
-
-        self.shared.storage.store(new, Ordering::Release);
-
-        // SAFETY: No other references to `old` exist, so it's safe to drop.
-        let _ = unsafe { Box::from_raw(old) };
     }
 }
 
@@ -171,6 +195,22 @@ mod test {
         assert_eq!(*reader.read(), 1);
         *writer.write() += 1;
         assert_eq!(*reader.read(), 2);
+    }
+
+    #[test]
+    fn setting_the_value() {
+        let (writer, mut reader) = realtime_reader(0);
+
+        writer.set(5);
+        assert_eq!(*reader.read(), 5);
+    }
+
+    #[test]
+    fn updating_the_value() {
+        let (writer, mut reader) = realtime_reader(0);
+
+        writer.update(|value| *value = 5);
+        assert_eq!(*reader.read(), 5);
     }
 
     #[test]
