@@ -21,7 +21,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-real-time = "0.1"
+real-time = "0.2"
 ```
 
 ## License
