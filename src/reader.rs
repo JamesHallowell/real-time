@@ -74,11 +74,11 @@ impl<T> Shared<T> {
         unsafe { &*value }.clone()
     }
 
-    fn store(&self, value: T) {
+    fn swap(&self, value: Box<T>) -> Box<T> {
         let old = self.storage.load(Ordering::Acquire);
         assert_ne!(old, null_mut());
 
-        let new = Box::into_raw(Box::new(value));
+        let new = Box::into_raw(value);
         while self
             .live
             .compare_exchange_weak(old, new, Ordering::SeqCst, Ordering::Relaxed)
@@ -90,8 +90,12 @@ impl<T> Shared<T> {
 
         self.storage.store(new, Ordering::Release);
 
-        // SAFETY: No other references to `old` exist, so it's safe to drop.
-        let _ = unsafe { Box::from_raw(old) };
+        // SAFETY: No other references to `old` exist, so we can reconstruct the box.
+        unsafe { Box::from_raw(old) }
+    }
+
+    fn store(&self, value: T) {
+        let _ = self.swap(Box::new(value));
     }
 }
 
@@ -157,6 +161,11 @@ impl<T> LockingWriter<T> {
 
         let value = Some(shared.load());
         LockingWriteGuard { shared, value }
+    }
+
+    /// Update the value and return the previous value.
+    pub fn swap(&self, value: Box<T>) -> Box<T> {
+        self.shared.lock().unwrap().swap(value)
     }
 }
 
@@ -241,5 +250,23 @@ mod test {
         }
 
         assert_eq!(*reader.read(), 1_000);
+    }
+
+    #[test]
+    fn swapping_the_value() {
+        use std::ptr::addr_of;
+
+        let a = Box::new(1);
+        let addr_of_a = addr_of!(*a);
+
+        let (writer, mut reader) = realtime_reader(0);
+
+        let mut b = writer.swap(a);
+        assert_eq!(*reader.read(), 1);
+        *b = 2;
+
+        let c = writer.swap(b);
+        assert_eq!(*reader.read(), 2);
+        assert_eq!(addr_of!(*c), addr_of_a);
     }
 }
