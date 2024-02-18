@@ -14,12 +14,18 @@ struct Big {
     _padding: [u8; 64],
 }
 
-impl Default for Big {
-    fn default() -> Self {
+impl Big {
+    fn new(count: i64) -> Self {
         Self {
-            count: 0,
+            count,
             _padding: [0; 64],
         }
+    }
+}
+
+impl Default for Big {
+    fn default() -> Self {
+        Self::new(0)
     }
 }
 
@@ -55,12 +61,12 @@ fn reading_on_real_time_thread_with_multiple_simultaneously_writers() {
 fn writing_on_real_time_thread_with_multiple_simultaneously_readers() {
     loom::model(|| {
         let (reader, mut writer) = realtime_writer(Big::default());
-        let reader = Arc::new(reader);
+        let reader = Arc::new(Mutex::new(reader));
 
         const READERS: i64 = 2;
         const READS: i64 = 2;
 
-        writer.write().count = 1;
+        writer.set(Big::new(1));
 
         for _ in 0..READERS {
             thread::spawn({
@@ -69,7 +75,7 @@ fn writing_on_real_time_thread_with_multiple_simultaneously_readers() {
                     let mut last_read = None;
 
                     for _ in 0..READS {
-                        let value = reader.lock().count;
+                        let value = reader.lock().unwrap().get_ref().count;
 
                         assert!(value == 1 || value == 2);
                         assert!(last_read.is_none() || last_read <= Some(value));
@@ -80,6 +86,6 @@ fn writing_on_real_time_thread_with_multiple_simultaneously_readers() {
             });
         }
 
-        writer.write().count += 1;
+        writer.set(Big::new(2));
     });
 }
