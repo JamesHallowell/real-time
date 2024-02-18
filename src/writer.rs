@@ -2,48 +2,28 @@ use {
     crate::{
         sync::{
             atomic::{AtomicU8, Ordering},
-            Arc, Mutex, MutexGuard,
+            Arc,
         },
         PhantomUnsync,
     },
-    std::{
-        cell::UnsafeCell,
-        marker::PhantomData,
-        ops::{Deref, DerefMut},
-    },
+    std::{cell::UnsafeCell, hint, marker::PhantomData},
 };
 
 /// A shared value that can read on a non-real-time thread.
 pub struct LockingReader<T> {
-    shared: Mutex<Arc<Shared<T>>>,
+    shared: Arc<Shared<T>>,
 }
 
 /// A shared value that can be mutated on the real-time thread without blocking.
 pub struct RealtimeWriter<T> {
     shared: Arc<Shared<T>>,
-    value: T,
     _marker: PhantomUnsync,
-}
-
-/// A guard that allows reading the shared value on a non-real-time thread.
-pub struct ReadGuard<'a, T> {
-    lock: MutexGuard<'a, Arc<Shared<T>>>,
-}
-
-/// A guard that allows mutating the shared value on the real-time thread.
-///
-/// The updated value will only be observed by any non-real-time thread after the guard is dropped.
-pub struct WriteGuard<'a, T>
-where
-    T: Copy,
-{
-    writer: &'a mut RealtimeWriter<T>,
 }
 
 /// Creates a shared value that can be mutated on the real-time thread without blocking.
 pub fn realtime_writer<T>(value: T) -> (LockingReader<T>, RealtimeWriter<T>)
 where
-    T: Copy,
+    T: Copy + Send,
 {
     let shared = Arc::new(Shared {
         values: [UnsafeCell::new(value), UnsafeCell::new(value)],
@@ -52,11 +32,10 @@ where
 
     (
         LockingReader {
-            shared: Mutex::new(shared.clone()),
+            shared: Arc::clone(&shared),
         },
         RealtimeWriter {
             shared,
-            value,
             _marker: PhantomData,
         },
     )
@@ -74,204 +53,279 @@ unsafe impl<T> Sync for Shared<T> {}
 enum ControlBit {
     Index = 0b001,
     Busy = 0b010,
-    Update = 0b100,
+    NewData = 0b100,
 }
 
-trait ControlBits {
-    fn index(self) -> usize;
-    fn is_bit_set(&self, bit: ControlBit) -> bool;
-    fn with_bit_set(self, bit: ControlBit) -> Self;
-    fn with_bit_unset(self, bit: ControlBit) -> Self;
-    fn with_bit_flipped(self, bit: ControlBit) -> Self;
-    fn bitwise_and(self, other: ControlBit) -> Self;
+impl From<ControlBit> for u8 {
+    fn from(bit: ControlBit) -> u8 {
+        bit as u8
+    }
 }
 
-impl ControlBits for u8 {
-    fn index(self) -> usize {
-        (self & ControlBit::Index as u8) as usize
-    }
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+struct ControlBits(u8);
 
-    fn is_bit_set(&self, bit: ControlBit) -> bool {
-        self & (bit as u8) != 0
+impl ControlBits {
+    fn is_set(&self, bit: ControlBit) -> bool {
+        self.0 & (bit as u8) != 0
     }
-
-    fn with_bit_set(self, bit: ControlBit) -> Self {
-        self | (bit as u8)
+    fn set(self, bit: ControlBit) -> Self {
+        (self.0 | (bit as u8)).into()
     }
-
-    fn with_bit_unset(self, bit: ControlBit) -> Self {
-        self & !(bit as u8)
+    fn unset(self, bit: ControlBit) -> Self {
+        (self.0 & !(bit as u8)).into()
     }
-
-    fn with_bit_flipped(self, bit: ControlBit) -> Self {
-        self ^ (bit as u8)
+    fn flip(self, bit: ControlBit) -> Self {
+        (self.0 ^ (bit as u8)).into()
     }
-
     fn bitwise_and(self, bit: ControlBit) -> Self {
-        self & bit as u8
+        (self.0 & (bit as u8)).into()
+    }
+    fn write_index(self) -> usize {
+        self.bitwise_and(ControlBit::Index).0 as usize
+    }
+    fn read_index(self) -> usize {
+        self.bitwise_and(ControlBit::Index)
+            .flip(ControlBit::Index)
+            .0 as usize
     }
 }
 
-impl<T> Shared<T> {
-    pub fn write(&self, value: T) {
-        let control = self
-            .control
-            .fetch_or(ControlBit::Busy as u8, Ordering::Acquire);
-
-        {
-            let write_slot = &self.values[control.index()];
-            let write_slot = unsafe { &mut *write_slot.get() };
-
-            *write_slot = value;
-        }
-
-        self.control
-            .store(control.with_bit_set(ControlBit::Update), Ordering::Release);
+impl From<ControlBits> for u8 {
+    fn from(bits: ControlBits) -> u8 {
+        bits.0
     }
+}
 
-    pub fn read(&self) -> &T {
-        let control = self.control.load(Ordering::Acquire);
-
-        let index = control
-            .is_bit_set(ControlBit::Update)
-            .then(|| {
-                let mut current = control;
-                loop {
-                    match self.control.compare_exchange_weak(
-                        current.with_bit_unset(ControlBit::Busy),
-                        current
-                            .bitwise_and(ControlBit::Index)
-                            .with_bit_flipped(ControlBit::Index),
-                        Ordering::AcqRel,
-                        Ordering::Relaxed,
-                    ) {
-                        Ok(current) => return current,
-                        Err(actual_current) => {
-                            current = actual_current;
-                        }
-                    }
-
-                    #[cfg(loom)]
-                    loom::thread::yield_now();
-                }
-            })
-            .unwrap_or(control.with_bit_flipped(ControlBit::Index))
-            .index();
-
-        unsafe { &*self.values[index].get() }
+impl From<u8> for ControlBits {
+    fn from(byte: u8) -> ControlBits {
+        ControlBits(byte)
     }
 }
 
 impl<T> LockingReader<T> {
-    /// Lock the shared value for reading on a non-real-time thread.
-    pub fn lock(&self) -> ReadGuard<'_, T> {
-        let lock = self.shared.lock().unwrap();
-        ReadGuard { lock }
+    /// Read the shared value on the non-real-time thread.
+    pub fn get(&mut self) -> T
+    where
+        T: Send + Copy,
+    {
+        *self.get_ref()
+    }
+
+    /// Read the shared value on the non-real-time thread.
+    pub fn get_ref(&mut self) -> &T
+    where
+        T: Send,
+    {
+        let control: ControlBits = self.shared.control.load(Ordering::SeqCst).into();
+
+        let read_index = control
+            .is_set(ControlBit::NewData)
+            .then(|| {
+                let mut control = control;
+                loop {
+                    // Wait until the writer has finished writing...
+                    let current = control.unset(ControlBit::Busy);
+
+                    // ...and then swap the read and write slots, also clearing the new data bit.
+                    let new = current.unset(ControlBit::NewData).flip(ControlBit::Index);
+
+                    match self
+                        .shared
+                        .control
+                        .compare_exchange_weak(
+                            current.into(),
+                            new.into(),
+                            Ordering::AcqRel,
+                            Ordering::Relaxed,
+                        )
+                        .map(ControlBits)
+                    {
+                        Ok(previous) => {
+                            return previous.write_index();
+                        }
+                        Err(actual) => {
+                            control = actual.into();
+                            hint::spin_loop();
+
+                            #[cfg(loom)]
+                            loom::thread::yield_now();
+                        }
+                    }
+                }
+            })
+            .unwrap_or(control.read_index());
+
+        // SAFETY: We have unique access to the value in the read slot.
+        unsafe { &*self.shared.values[read_index].get() }
     }
 }
 
 impl<T> RealtimeWriter<T> {
-    /// Set the shared value any make the update immediately available to any non-real-time threads.
-    pub fn set(&mut self, value: T) {
-        self.shared.write(value);
-    }
-
-    /// Modify the shared value on the real-time thread.
-    pub fn write(&mut self) -> WriteGuard<'_, T>
+    /// Set the shared value and make the update immediately available to any non-real-time threads.
+    pub fn set(&mut self, value: T)
     where
-        T: Copy,
+        T: Send,
     {
-        WriteGuard { writer: self }
-    }
-}
+        // Set the busy bit to prevent the reader from swapping the slots whilst we are writing.
+        let control: ControlBits = self
+            .shared
+            .control
+            .fetch_or(ControlBit::Busy.into(), Ordering::Acquire)
+            .into();
 
-impl<T> Deref for ReadGuard<'_, T> {
-    type Target = T;
+        {
+            let write_slot = &self.shared.values[control.write_index()];
 
-    fn deref(&self) -> &Self::Target {
-        self.lock.read()
-    }
-}
+            // SAFETY: We have unique access to the value in the write slot.
+            let write_value = unsafe { &mut *write_slot.get() };
+            *write_value = value;
+        }
 
-impl<T> Deref for WriteGuard<'_, T>
-where
-    T: Copy,
-{
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        &self.writer.value
-    }
-}
-
-impl<T> DerefMut for WriteGuard<'_, T>
-where
-    T: Copy,
-{
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.writer.value
-    }
-}
-
-impl<T> Drop for WriteGuard<'_, T>
-where
-    T: Copy,
-{
-    fn drop(&mut self) {
-        self.writer.shared.write(self.writer.value);
+        // Tell the reader that new data is available and clear the busy bit.
+        self.shared
+            .control
+            .store(control.set(ControlBit::NewData).into(), Ordering::Release);
     }
 }
 
 #[cfg(test)]
 mod test {
-    use {super::*, std::thread};
+    use {
+        super::*,
+        std::{sync::Mutex, thread},
+    };
 
     #[test]
-    fn working_with_control_bits() {
-        assert_eq!(0b000.index(), 0);
-        assert_eq!(0b000.with_bit_set(ControlBit::Index).index(), 1);
-        assert_eq!(0b010.with_bit_unset(ControlBit::Busy), 0b000);
-        assert!(0b100.is_bit_set(ControlBit::Update));
-        assert_eq!(0b010.with_bit_flipped(ControlBit::Busy), 0b000);
+    fn determining_the_read_and_write_indexes() {
+        let control = ControlBits(0b000);
+
+        assert_eq!(control.write_index(), 0);
+        assert_eq!(control.read_index(), 1);
+
+        let control = control.flip(ControlBit::Index);
+
+        assert_eq!(control.write_index(), 1);
+        assert_eq!(control.read_index(), 0);
+    }
+
+    #[test]
+    fn setting_bits_in_the_control() {
+        let control = ControlBits(0b000);
+
+        assert!(!control.is_set(ControlBit::Index));
+        assert!(!control.is_set(ControlBit::Busy));
+        assert!(!control.is_set(ControlBit::NewData));
+
+        let control = control.set(ControlBit::Busy);
+
+        assert!(!control.is_set(ControlBit::Index));
+        assert!(control.is_set(ControlBit::Busy));
+        assert!(!control.is_set(ControlBit::NewData));
+
+        let control = control.unset(ControlBit::Busy).set(ControlBit::NewData);
+
+        assert!(!control.is_set(ControlBit::Index));
+        assert!(!control.is_set(ControlBit::Busy));
+        assert!(control.is_set(ControlBit::NewData));
+    }
+
+    #[test]
+    fn managing_the_control_bits() {
+        let (mut reader, mut writer) = realtime_writer(0);
+        let get_controls_bits =
+            |writer: &RealtimeWriter<_>| ControlBits(writer.shared.control.load(Ordering::SeqCst));
+
+        {
+            let initial_control_bits = get_controls_bits(&writer);
+            assert!(!initial_control_bits.is_set(ControlBit::Busy));
+            assert!(!initial_control_bits.is_set(ControlBit::NewData));
+            assert_eq!(initial_control_bits.write_index(), 0);
+            assert_eq!(initial_control_bits.read_index(), 1);
+        }
+
+        writer.set(1);
+
+        {
+            let control_bits_after_set = get_controls_bits(&writer);
+            assert!(!control_bits_after_set.is_set(ControlBit::Busy));
+            assert!(control_bits_after_set.is_set(ControlBit::NewData));
+            assert_eq!(control_bits_after_set.write_index(), 0);
+            assert_eq!(control_bits_after_set.read_index(), 1);
+        }
+
+        let _value = reader.get();
+
+        {
+            let control_bits_after_get = get_controls_bits(&writer);
+            assert!(!control_bits_after_get.is_set(ControlBit::Busy));
+            assert!(!control_bits_after_get.is_set(ControlBit::NewData));
+            assert_eq!(control_bits_after_get.write_index(), 1);
+            assert_eq!(control_bits_after_get.read_index(), 0);
+        }
+
+        writer.set(2);
+
+        {
+            let control_bits_after_set = get_controls_bits(&writer);
+            assert!(!control_bits_after_set.is_set(ControlBit::Busy));
+            assert!(control_bits_after_set.is_set(ControlBit::NewData));
+            assert_eq!(control_bits_after_set.write_index(), 1);
+            assert_eq!(control_bits_after_set.read_index(), 0);
+        }
     }
 
     #[test]
     fn multiple_reads_before_new_writes_dont_read_old_data() {
-        let (reader, mut writer) = realtime_writer(0);
+        let (mut reader, mut writer) = realtime_writer(0);
 
-        assert_eq!(*reader.lock(), 0);
+        assert_eq!(reader.get(), 0);
 
         writer.set(1);
 
-        assert_eq!(*reader.lock(), 1);
-        assert_eq!(*reader.lock(), 1);
+        assert_eq!(reader.get(), 1);
+        assert_eq!(reader.get(), 1);
 
         writer.set(2);
 
-        assert_eq!(*reader.lock(), 2);
-        assert_eq!(*reader.lock(), 2);
+        assert_eq!(reader.get(), 2);
+        assert_eq!(reader.get(), 2);
     }
 
     #[test]
-    fn read_and_writing_simultaneously() {
+    fn reading_and_writing_simultaneously() {
         let (reader, mut writer) = realtime_writer(0);
 
-        let reader = Arc::new(reader);
+        let shared_reader = Arc::new(Mutex::new(reader));
 
         let readers = (0..10)
             .map(|_| {
                 thread::spawn({
-                    let reader = Arc::clone(&reader);
+                    let reader = Arc::clone(&shared_reader);
                     move || {
-                        while *reader.lock() < 100 {
-                            thread::yield_now();
+                        let read_value = || {
+                            let mut reader = reader.lock().unwrap();
+                            reader.get()
+                        };
+
+                        let last_value = read_value();
+                        loop {
+                            let value = read_value();
+
+                            assert!(value <= 1000);
+                            assert!(value >= 0);
+                            assert!(value >= last_value);
+
+                            if value == 1000 {
+                                break;
+                            }
                         }
                     }
                 })
             })
             .collect::<Vec<_>>();
 
-        for i in 0..=100 {
+        for i in 0..=1000 {
             writer.set(i);
         }
 
