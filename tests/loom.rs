@@ -1,7 +1,10 @@
 #![cfg(loom)]
 
 use {
-    loom::{sync::Arc, thread},
+    loom::{
+        sync::{Arc, Mutex},
+        thread,
+    },
     real_time::{reader::realtime_reader, writer::realtime_writer},
 };
 
@@ -24,7 +27,7 @@ impl Default for Big {
 fn reading_on_real_time_thread_with_multiple_simultaneously_writers() {
     loom::model(|| {
         let (writer, mut reader) = realtime_reader(Big::default());
-        let writer = Arc::new(writer);
+        let writer = Arc::new(Mutex::new(writer));
 
         const WRITERS: i64 = 2;
         const WRITES: i64 = 3;
@@ -34,13 +37,16 @@ fn reading_on_real_time_thread_with_multiple_simultaneously_writers() {
                 let writer = Arc::clone(&writer);
                 move || {
                     for _ in 0..WRITES {
-                        writer.write().count += 1;
+                        writer.lock().unwrap().update(|mut value| {
+                            value.count += 1;
+                            value
+                        });
                     }
                 }
             });
         }
 
-        let value = reader.read();
+        let value = reader.get();
         assert!(value.count >= 0 && value.count <= WRITERS * WRITES)
     });
 }
