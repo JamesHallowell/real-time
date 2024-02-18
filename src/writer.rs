@@ -1,12 +1,13 @@
 use {
     crate::{
+        hint,
         sync::{
             atomic::{AtomicU8, Ordering},
             Arc,
         },
         PhantomUnsync,
     },
-    std::{cell::UnsafeCell, hint, marker::PhantomData},
+    std::{cell::UnsafeCell, marker::PhantomData},
 };
 
 /// A shared value that can read on a non-real-time thread.
@@ -147,9 +148,6 @@ impl<T> LockingReader<T> {
                         Err(actual) => {
                             control = actual.into();
                             hint::spin_loop();
-
-                            #[cfg(loom)]
-                            loom::thread::yield_now();
                         }
                     }
                 }

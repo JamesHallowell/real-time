@@ -1,12 +1,13 @@
 use {
     crate::{
+        hint,
         sync::{
             atomic::{AtomicPtr, Ordering},
             Arc,
         },
         PhantomUnsync,
     },
-    std::{hint, marker::PhantomData, ops::Deref, ptr::null_mut},
+    std::{marker::PhantomData, ops::Deref, ptr::null_mut},
 };
 
 /// A shared value that can be read on the real-time thread without blocking.
@@ -138,9 +139,6 @@ impl<T> LockingWriter<T> {
             .compare_exchange_weak(old, new, Ordering::SeqCst, Ordering::Relaxed)
             .is_err()
         {
-            #[cfg(loom)]
-            loom::thread::yield_now();
-
             hint::spin_loop();
         }
 
