@@ -2,15 +2,11 @@ use {
     crate::{
         sync::{
             atomic::{AtomicPtr, Ordering},
-            Arc, Mutex, MutexGuard,
+            Arc,
         },
         PhantomUnsync,
     },
-    std::{
-        marker::PhantomData,
-        ops::{Deref, DerefMut},
-        ptr::null_mut,
-    },
+    std::{hint, marker::PhantomData, ops::Deref, ptr::null_mut},
 };
 
 /// A shared value that can be read on the real-time thread without blocking.
@@ -21,7 +17,7 @@ pub struct RealtimeReader<T> {
 
 /// A shared value that can be mutated on a non-real-time thread.
 pub struct LockingWriter<T> {
-    shared: Mutex<Arc<Shared<T>>>,
+    shared: Arc<Shared<T>>,
 }
 
 /// A guard that allows reading the shared value on the real-time thread.
@@ -30,26 +26,22 @@ pub struct RealtimeReadGuard<'a, T> {
     value: *mut T,
 }
 
-/// A guard that allows mutating the shared value on a non-real-time thread.
-///
-/// The updated value will only be observed by the real-time thread after the guard is dropped.
-pub struct LockingWriteGuard<'a, T> {
-    shared: MutexGuard<'a, Arc<Shared<T>>>,
-    value: Option<T>,
-}
-
 /// Creates a shared value that can be read on the real-time thread without blocking.
-pub fn realtime_reader<T>(value: T) -> (LockingWriter<T>, RealtimeReader<T>) {
+pub fn realtime_reader<T>(value: T) -> (LockingWriter<T>, RealtimeReader<T>)
+where
+    T: Send,
+{
     let value = Box::into_raw(Box::new(value));
 
     let shared = Arc::new(Shared {
         live: AtomicPtr::new(value),
         storage: AtomicPtr::new(value),
+        _marker: PhantomData,
     });
 
     (
         LockingWriter {
-            shared: Mutex::new(shared.clone()),
+            shared: Arc::clone(&shared),
         },
         RealtimeReader {
             shared,
@@ -61,42 +53,7 @@ pub fn realtime_reader<T>(value: T) -> (LockingWriter<T>, RealtimeReader<T>) {
 struct Shared<T> {
     storage: AtomicPtr<T>,
     live: AtomicPtr<T>,
-}
-
-impl<T> Shared<T> {
-    fn load(&self) -> T
-    where
-        T: Clone,
-    {
-        let value = self.storage.load(Ordering::Relaxed);
-        assert_ne!(value, null_mut());
-
-        unsafe { &*value }.clone()
-    }
-
-    fn swap(&self, value: Box<T>) -> Box<T> {
-        let old = self.storage.load(Ordering::Acquire);
-        assert_ne!(old, null_mut());
-
-        let new = Box::into_raw(value);
-        while self
-            .live
-            .compare_exchange_weak(old, new, Ordering::SeqCst, Ordering::Relaxed)
-            .is_err()
-        {
-            #[cfg(loom)]
-            loom::thread::yield_now();
-        }
-
-        self.storage.store(new, Ordering::Release);
-
-        // SAFETY: No other references to `old` exist, so we can reconstruct the box.
-        unsafe { Box::from_raw(old) }
-    }
-
-    fn store(&self, value: T) {
-        let _ = self.swap(Box::new(value));
-    }
+    _marker: PhantomData<T>,
 }
 
 impl<T> Drop for Shared<T> {
@@ -111,7 +68,7 @@ impl<T> Drop for Shared<T> {
 
 impl<T> RealtimeReader<T> {
     /// Read the shared value on the real-time thread.
-    pub fn read(&mut self) -> RealtimeReadGuard<'_, T> {
+    pub fn lock(&mut self) -> RealtimeReadGuard<'_, T> {
         let value = self.shared.live.swap(null_mut(), Ordering::SeqCst);
         assert_ne!(value, null_mut());
 
@@ -119,6 +76,14 @@ impl<T> RealtimeReader<T> {
             shared: &self.shared,
             value,
         }
+    }
+
+    /// Clone the shared value and return it.
+    pub fn get(&mut self) -> T
+    where
+        T: Clone,
+    {
+        self.lock().clone()
     }
 }
 
@@ -139,102 +104,92 @@ impl<T> Deref for RealtimeReadGuard<'_, T> {
 
 impl<T> LockingWriter<T> {
     /// Set the value.
-    pub fn set(&self, value: T) {
-        self.shared.lock().unwrap().store(value);
+    pub fn set(&mut self, value: T)
+    where
+        T: Send,
+    {
+        let _ = self.swap(Box::new(value));
     }
 
     /// Update the value.
-    pub fn update<R>(&self, mut updater: impl FnMut(&mut T) -> R) -> R
+    pub fn update(&mut self, mut updater: impl FnMut(T) -> T)
     where
-        T: Clone,
+        T: Clone + Send + Sync,
     {
-        let mut writer = self.write();
-        updater(&mut *writer)
-    }
+        let value = self.shared.storage.load(Ordering::Relaxed);
+        assert_ne!(value, null_mut());
+        let value = unsafe { &*value }.clone();
 
-    /// Mutate the shared value on a non-real-time thread.
-    pub fn write(&self) -> LockingWriteGuard<'_, T>
-    where
-        T: Clone,
-    {
-        let shared = self.shared.lock().unwrap();
-
-        let value = Some(shared.load());
-        LockingWriteGuard { shared, value }
+        self.set(updater(value));
     }
 
     /// Update the value and return the previous value.
-    pub fn swap(&self, value: Box<T>) -> Box<T> {
-        self.shared.lock().unwrap().swap(value)
-    }
-}
+    pub fn swap(&mut self, value: Box<T>) -> Box<T>
+    where
+        T: Send,
+    {
+        let old = self.shared.storage.load(Ordering::Acquire);
+        assert_ne!(old, null_mut());
 
-impl<T> Drop for LockingWriteGuard<'_, T> {
-    fn drop(&mut self) {
-        if let Some(value) = self.value.take() {
-            self.shared.store(value);
+        let new = Box::into_raw(value);
+        while self
+            .shared
+            .live
+            .compare_exchange_weak(old, new, Ordering::SeqCst, Ordering::Relaxed)
+            .is_err()
+        {
+            #[cfg(loom)]
+            loom::thread::yield_now();
+
+            hint::spin_loop();
         }
-    }
-}
 
-impl<T> Deref for LockingWriteGuard<'_, T> {
-    type Target = T;
+        self.shared.storage.store(new, Ordering::Release);
 
-    fn deref(&self) -> &Self::Target {
-        self.value.as_ref().expect("value taken twice")
-    }
-}
-
-impl<T> DerefMut for LockingWriteGuard<'_, T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.value.as_mut().expect("value taken twice")
+        // SAFETY: No other references to `old` exist, so we can reconstruct the box.
+        unsafe { Box::from_raw(old) }
     }
 }
 
 #[cfg(test)]
 mod test {
+    use std::sync::Mutex;
     use {super::*, std::thread};
 
     #[test]
-    fn read_and_write_to_shared_value() {
-        let (writer, mut reader) = realtime_reader(0);
+    fn setting_and_getting_the_shared_value() {
+        let (mut writer, mut reader) = realtime_reader(0);
 
-        assert_eq!(*reader.read(), 0);
-        *writer.write() += 1;
-        assert_eq!(*reader.read(), 1);
-        *writer.write() += 1;
-        assert_eq!(*reader.read(), 2);
-    }
-
-    #[test]
-    fn setting_the_value() {
-        let (writer, mut reader) = realtime_reader(0);
-
-        writer.set(5);
-        assert_eq!(*reader.read(), 5);
+        assert_eq!(reader.get(), 0);
+        writer.set(1);
+        assert_eq!(reader.get(), 1);
+        writer.set(2);
+        assert_eq!(reader.get(), 2);
     }
 
     #[test]
     fn updating_the_value() {
-        let (writer, mut reader) = realtime_reader(0);
+        let (mut writer, mut reader) = realtime_reader(0);
 
-        writer.update(|value| *value = 5);
-        assert_eq!(*reader.read(), 5);
+        writer.update(|value| value + 5);
+        assert_eq!(reader.get(), 5);
     }
 
     #[test]
-    fn read_and_writing_simultaneously() {
+    fn reading_and_writing_simultaneously_from_different_threads() {
         let (writer, mut reader) = realtime_reader(0);
+        let shared_writer = Arc::new(Mutex::new(writer));
 
-        let writer = Arc::new(writer);
+        const NUM_WRITER_THREADS: usize = 10;
+        const WRITES_PER_THREAD: usize = 100;
 
-        let writers = (0..10)
+        let writer_threads = (0..NUM_WRITER_THREADS)
             .map(|_| {
                 thread::spawn({
-                    let writer = Arc::clone(&writer);
+                    let shared_writer = Arc::clone(&shared_writer);
                     move || {
-                        for _ in 0..100 {
-                            *writer.write() += 1;
+                        for _ in 0..WRITES_PER_THREAD {
+                            shared_writer.lock().unwrap().update(|value| value + 1);
                         }
                     }
                 })
@@ -242,14 +197,17 @@ mod test {
             .collect::<Vec<_>>();
 
         let mut last_value = 0;
-        while !writers.iter().all(|writer| writer.is_finished()) {
-            let value = *reader.read();
-            assert!(value >= last_value);
-            assert!(value <= 1_000);
-            last_value = value;
+        while !writer_threads
+            .iter()
+            .all(|writer_thread| writer_thread.is_finished())
+        {
+            let value = reader.lock();
+            assert!(*value >= last_value);
+            assert!(*value <= NUM_WRITER_THREADS * WRITES_PER_THREAD);
+            last_value = *value;
         }
 
-        assert_eq!(*reader.read(), 1_000);
+        assert_eq!(reader.get(), NUM_WRITER_THREADS * WRITES_PER_THREAD);
     }
 
     #[test]
@@ -257,16 +215,16 @@ mod test {
         use std::ptr::addr_of;
 
         let a = Box::new(1);
-        let addr_of_a = addr_of!(*a);
+        let a_addr = addr_of!(*a);
 
-        let (writer, mut reader) = realtime_reader(0);
+        let (mut writer, mut reader) = realtime_reader(0);
 
         let mut b = writer.swap(a);
-        assert_eq!(*reader.read(), 1);
+        assert_eq!(reader.get(), 1);
         *b = 2;
 
         let c = writer.swap(b);
-        assert_eq!(*reader.read(), 2);
-        assert_eq!(addr_of!(*c), addr_of_a);
+        assert_eq!(reader.get(), 2);
+        assert_eq!(addr_of!(*c), a_addr);
     }
 }
