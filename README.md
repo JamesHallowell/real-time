@@ -10,7 +10,7 @@
 
 This is a port of some of the algorithms used by `RealtimeObject`
 from [FAbian's Realtime Box o' Tricks](https://github.com/hogliux/farbot), that was
-presented [at Meeting C++ 2019](https://www.youtube.com/watch?v=ndeN983j_GQ).
+[presented at Meeting C++ 2019](https://www.youtube.com/watch?v=ndeN983j_GQ).
 
 It allows data to be shared safely between
 a single real-time thread and multiple other threads, without blocking the real-time thread.
@@ -21,7 +21,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-real-time = "0.2"
+real-time = "0.3"
 ```
 
 ## License
