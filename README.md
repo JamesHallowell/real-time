@@ -1,4 +1,4 @@
-# real-time
+# real-time ⏱️
 
 [![Build](https://github.com/JamesHallowell/real-time/actions/workflows/ci.yml/badge.svg)](https://github.com/JamesHallowell/real-time/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/real-time.svg)](https://crates.io/crates/real-time)
@@ -13,7 +13,7 @@ from [FAbian's Realtime Box o' Tricks](https://github.com/hogliux/farbot), that 
 [presented at Meeting C++ 2019](https://www.youtube.com/watch?v=ndeN983j_GQ).
 
 It allows data to be shared safely between
-a single real-time thread and multiple other threads, without blocking the real-time thread.
+a single real-time thread and potentially multiple other threads, without blocking the real-time thread.
 
 ## Usage
 
