@@ -24,10 +24,10 @@ pub struct RealtimeWriter<T> {
 /// Creates a shared value that can be mutated on the real-time thread without blocking.
 pub fn realtime_writer<T>(value: T) -> (LockingReader<T>, RealtimeWriter<T>)
 where
-    T: Copy + Send,
+    T: Clone + Send,
 {
     let shared = Arc::new(Shared {
-        values: [UnsafeCell::new(value), UnsafeCell::new(value)],
+        values: [UnsafeCell::new(value.clone()), UnsafeCell::new(value)],
         control: AtomicU8::new(0),
     });
 
@@ -108,9 +108,9 @@ impl<T> LockingReader<T> {
     /// Read the shared value on the non-real-time thread.
     pub fn get(&mut self) -> T
     where
-        T: Send + Copy,
+        T: Send + Clone,
     {
-        *self.get_ref()
+        self.get_ref().clone()
     }
 
     /// Read the shared value on the non-real-time thread.
