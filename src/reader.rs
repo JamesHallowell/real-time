@@ -1,12 +1,12 @@
 use {
     crate::{
-        hint,
         sync::{
             atomic::{AtomicPtr, Ordering},
             Arc,
         },
         PhantomUnsync,
     },
+    crossbeam_utils::{Backoff, CachePadded},
     std::{marker::PhantomData, ops::Deref, ptr::null_mut},
 };
 
@@ -35,8 +35,8 @@ where
     let value = Box::into_raw(Box::new(value));
 
     let shared = Arc::new(Shared {
-        live: AtomicPtr::new(value),
-        storage: AtomicPtr::new(value),
+        live: CachePadded::new(AtomicPtr::new(value)),
+        storage: CachePadded::new(AtomicPtr::new(value)),
         _marker: PhantomData,
     });
 
@@ -52,8 +52,8 @@ where
 }
 
 struct Shared<T> {
-    storage: AtomicPtr<T>,
-    live: AtomicPtr<T>,
+    storage: CachePadded<AtomicPtr<T>>,
+    live: CachePadded<AtomicPtr<T>>,
     _marker: PhantomData<T>,
 }
 
@@ -133,13 +133,21 @@ impl<T> LockingWriter<T> {
         assert_ne!(old, null_mut());
 
         let new = Box::into_raw(value);
+
+        #[cfg(not(loom))]
+        let backoff = Backoff::new();
+
         while self
             .shared
             .live
             .compare_exchange_weak(old, new, Ordering::SeqCst, Ordering::Relaxed)
             .is_err()
         {
-            hint::spin_loop();
+            #[cfg(loom)]
+            loom::thread::yield_now();
+
+            #[cfg(not(loom))]
+            backoff.spin();
         }
 
         self.shared.storage.store(new, Ordering::Release);
@@ -151,8 +159,10 @@ impl<T> LockingWriter<T> {
 
 #[cfg(test)]
 mod test {
-    use std::sync::Mutex;
-    use {super::*, std::thread};
+    use {
+        super::*,
+        std::{sync::Mutex, thread},
+    };
 
     #[test]
     fn setting_and_getting_the_shared_value() {
