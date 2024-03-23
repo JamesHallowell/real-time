@@ -37,3 +37,15 @@ jobs:
           cargo miri setup
       - name: Test with Miri
         run: cargo miri test --verbose
+
+  thread-sanitizer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Install nightly toolchain
+        run: |
+          rustup toolchain install nightly
+          rustup component add rust-src --toolchain nightly-x86_64-unknown-linux-gnu
+          rustup override set nightly
+      - name: Test with ThreadSanitizer
+        run: RUSTFLAGS="-Z sanitizer=thread" cargo test -Z build-std --target x86_64-unknown-linux-gnu -- --test-threads 1
