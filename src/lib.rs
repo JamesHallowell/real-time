@@ -8,7 +8,10 @@ pub mod reader;
 /// Write shared data on the real-time thread.
 pub mod writer;
 
-mod hint;
+/// Lock-free FIFO.
+pub mod fifo;
+
 mod sync;
+mod thread;
 
 type PhantomUnsync = std::marker::PhantomData<std::cell::Cell<()>>;

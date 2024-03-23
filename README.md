@@ -8,12 +8,29 @@
 
 ## Overview
 
-This is a port of some of the algorithms used by `RealtimeObject`
-from [FAbian's Realtime Box o' Tricks](https://github.com/hogliux/farbot), that was
-[presented at Meeting C++ 2019](https://www.youtube.com/watch?v=ndeN983j_GQ).
+This crate provides some tools for sharing data with a real-time thread:
 
-It allows data to be shared safely between
-a single real-time thread and potentially multiple other threads, without blocking the real-time thread.
+**Shared Values**
+
+Type wrappers that can be used to share values between a real-time thread and another thread, in
+a way that is real-time safe.
+
+They use the same algorithms as `RealtimeObject`
+from [FAbian's Realtime Box o' Tricks](https://github.com/hogliux/farbot), that
+was [presented at Meeting C++ 2019](https://www.youtube.com/watch?v=ndeN983j_GQ).
+
+- [`RealtimeReader`], for reading from a shared value on a real-time thread.
+- [`RealtimeWriter`], for writing to a shared value on a real-time thread.
+
+**FIFOs**
+
+- [`fifo`], a lock-free single-producer, single-consumer FIFO that is optimised for a real-time consumer.
+
+[`RealtimeReader`]: https://docs.rs/real-time/latest/real_time/reader/struct.RealtimeReader.html
+
+[`RealtimeWriter`]: https://docs.rs/real-time/latest/real_time/writer/struct.RealtimeWriter.html
+
+[`fifo`]: https://docs.rs/real-time/latest/real_time/fifo/fn.fifo.html
 
 ## Usage
 

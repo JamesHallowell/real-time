@@ -12,6 +12,7 @@ crossbeam-utils = "0.8.19"
 loom = "0.7.1"
 
 [dev-dependencies]
+beady = "0.6.1"
 criterion = { version = "0.5.1", features = ["html_reports"] }
 
 [[bench]]

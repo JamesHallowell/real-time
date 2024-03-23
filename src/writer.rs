@@ -1,6 +1,5 @@
 use {
     crate::{
-        hint,
         sync::{
             atomic::{AtomicU8, Ordering},
             Arc,
@@ -147,7 +146,12 @@ impl<T> LockingReader<T> {
                         }
                         Err(actual) => {
                             control = actual.into();
-                            hint::spin_loop();
+
+                            #[cfg(not(loom))]
+                            std::hint::spin_loop();
+
+                            #[cfg(loom)]
+                            loom::thread::yield_now();
                         }
                     }
                 }

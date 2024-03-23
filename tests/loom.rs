@@ -89,3 +89,19 @@ fn writing_on_real_time_thread_with_multiple_simultaneously_readers() {
         writer.set(Big::new(2));
     });
 }
+
+#[test]
+fn single_consumer_single_producer_fifo() {
+    loom::model(|| {
+        let (tx, rx) = real_time::fifo::fifo(1);
+
+        thread::spawn(move || {
+            assert!(tx.push(1).is_ok());
+            let _ = tx.push(2);
+        });
+
+        assert!(matches!(rx.pop(), None | Some(1)));
+        assert!(matches!(rx.pop(), None | Some(2)));
+        assert!(rx.pop().is_none());
+    })
+}
