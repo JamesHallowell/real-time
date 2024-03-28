@@ -7,7 +7,11 @@ use {
         PhantomUnsync,
     },
     crossbeam_utils::{Backoff, CachePadded},
-    std::{marker::PhantomData, ops::Deref, ptr::null_mut},
+    std::{
+        marker::PhantomData,
+        ops::{Deref, DerefMut},
+        ptr::null_mut,
+    },
 };
 
 /// A shared value that can be read on the real-time thread without blocking.
@@ -93,6 +97,13 @@ impl<T> RealtimeReader<T> {
 impl<T> Drop for RealtimeReadGuard<'_, T> {
     fn drop(&mut self) {
         self.shared.live.store(self.value, Ordering::SeqCst);
+    }
+}
+
+impl<T> DerefMut for RealtimeReadGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        // SAFETY: `self.value` is a valid pointer for the lifetime of `self`.
+        unsafe { &mut *self.value }
     }
 }
 
