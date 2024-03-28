@@ -32,7 +32,7 @@ impl Default for Big {
 #[test]
 fn reading_on_real_time_thread_with_multiple_simultaneously_writers() {
     loom::model(|| {
-        let (writer, mut reader) = realtime_reader(Big::default());
+        let (writer, reader) = realtime_reader(Big::default());
         let writer = Arc::new(Mutex::new(writer));
 
         const WRITERS: i64 = 2;
@@ -60,7 +60,7 @@ fn reading_on_real_time_thread_with_multiple_simultaneously_writers() {
 #[test]
 fn writing_on_real_time_thread_with_multiple_simultaneously_readers() {
     loom::model(|| {
-        let (reader, mut writer) = realtime_writer(Big::default());
+        let (reader, writer) = realtime_writer(Big::default());
         let reader = Arc::new(Mutex::new(reader));
 
         const READERS: i64 = 2;
