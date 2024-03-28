@@ -38,7 +38,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-real-time = "0.4"
+real-time = "0.5"
 ```
 
 ## License
