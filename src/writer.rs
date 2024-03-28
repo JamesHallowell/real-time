@@ -12,6 +12,7 @@ use {
 /// A shared value that can read on a non-real-time thread.
 pub struct LockingReader<T> {
     shared: Arc<Shared<T>>,
+    _marker: PhantomUnsync,
 }
 
 /// A shared value that can be mutated on the real-time thread without blocking.
@@ -33,6 +34,7 @@ where
     (
         LockingReader {
             shared: Arc::clone(&shared),
+            _marker: PhantomData,
         },
         RealtimeWriter {
             shared,
@@ -105,7 +107,7 @@ impl From<u8> for ControlBits {
 
 impl<T> LockingReader<T> {
     /// Read the shared value on the non-real-time thread.
-    pub fn get(&mut self) -> T
+    pub fn get(&self) -> T
     where
         T: Send + Clone,
     {
@@ -113,7 +115,7 @@ impl<T> LockingReader<T> {
     }
 
     /// Read the shared value on the non-real-time thread.
-    pub fn get_ref(&mut self) -> &T
+    pub fn get_ref(&self) -> &T
     where
         T: Send,
     {
@@ -165,7 +167,7 @@ impl<T> LockingReader<T> {
 
 impl<T> RealtimeWriter<T> {
     /// Set the shared value and make the update immediately available to any non-real-time threads.
-    pub fn set(&mut self, value: T)
+    pub fn set(&self, value: T)
     where
         T: Send,
     {
@@ -195,8 +197,15 @@ impl<T> RealtimeWriter<T> {
 mod test {
     use {
         super::*,
+        static_assertions::{assert_impl_all, assert_not_impl_all},
         std::{sync::Mutex, thread},
     };
+
+    assert_impl_all!(RealtimeWriter<i32>: Send);
+    assert_not_impl_all!(RealtimeWriter<i32>: Sync);
+
+    assert_impl_all!(LockingReader<i32>: Send);
+    assert_not_impl_all!(LockingReader<i32>: Sync);
 
     #[test]
     fn determining_the_read_and_write_indexes() {
@@ -234,7 +243,7 @@ mod test {
 
     #[test]
     fn managing_the_control_bits() {
-        let (mut reader, mut writer) = realtime_writer(0);
+        let (reader, writer) = realtime_writer(0);
         let get_controls_bits =
             |writer: &RealtimeWriter<_>| ControlBits(writer.shared.control.load(Ordering::SeqCst));
 
@@ -279,7 +288,7 @@ mod test {
 
     #[test]
     fn multiple_reads_before_new_writes_dont_read_old_data() {
-        let (mut reader, mut writer) = realtime_writer(0);
+        let (reader, writer) = realtime_writer(0);
 
         assert_eq!(reader.get(), 0);
 
@@ -296,7 +305,7 @@ mod test {
 
     #[test]
     fn reading_and_writing_simultaneously() {
-        let (reader, mut writer) = realtime_writer(0);
+        let (reader, writer) = realtime_writer(0);
 
         let shared_reader = Arc::new(Mutex::new(reader));
 
@@ -306,7 +315,7 @@ mod test {
                     let reader = Arc::clone(&shared_reader);
                     move || {
                         let read_value = || {
-                            let mut reader = reader.lock().unwrap();
+                            let reader = reader.lock().unwrap();
                             reader.get()
                         };
 
