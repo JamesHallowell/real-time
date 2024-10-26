@@ -198,10 +198,10 @@ mod test {
     };
 
     assert_impl_all!(RealtimeWriter<i32>: Send);
-    assert_not_impl_all!(RealtimeWriter<i32>: Sync);
+    assert_not_impl_all!(RealtimeWriter<i32>: Sync, Copy, Clone);
 
     assert_impl_all!(LockingReader<i32>: Send);
-    assert_not_impl_all!(LockingReader<i32>: Sync);
+    assert_not_impl_all!(LockingReader<i32>: Sync, Copy, Clone);
 
     #[test]
     fn determining_the_read_and_write_indexes() {
