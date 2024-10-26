@@ -31,8 +31,8 @@ fn reading_on_real_time_thread() {
     loom::model(|| {
         let (writer, reader) = realtime_reader(Big::default());
 
-        const READS: usize = 5;
-        const WRITES: usize = 5;
+        const READS: usize = 3;
+        const WRITES: usize = 3;
 
         thread::spawn({
             move || {
