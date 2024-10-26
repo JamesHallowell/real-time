@@ -11,6 +11,7 @@ pub mod writer;
 /// Lock-free FIFO.
 pub mod fifo;
 
+mod backoff;
 mod sync;
 mod thread;
 

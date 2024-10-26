@@ -1,10 +1,7 @@
 #![cfg(loom)]
 
 use {
-    loom::{
-        sync::{Arc, Mutex},
-        thread,
-    },
+    loom::thread,
     real_time::{reader::realtime_reader, writer::realtime_writer},
 };
 
@@ -30,63 +27,52 @@ impl Default for Big {
 }
 
 #[test]
-fn reading_on_real_time_thread_with_multiple_simultaneously_writers() {
+fn reading_on_real_time_thread() {
     loom::model(|| {
         let (writer, reader) = realtime_reader(Big::default());
-        let writer = Arc::new(Mutex::new(writer));
 
-        const WRITERS: i64 = 2;
-        const WRITES: i64 = 3;
+        const READS: usize = 5;
+        const WRITES: usize = 5;
 
-        for _ in 0..WRITERS {
-            thread::spawn({
-                let writer = Arc::clone(&writer);
-                move || {
-                    for _ in 0..WRITES {
-                        writer.lock().unwrap().update(|mut value| {
-                            value.count += 1;
-                            value
-                        });
-                    }
+        thread::spawn({
+            move || {
+                for value in (0..WRITES).map(|value| Big::new(value as i64)) {
+                    writer.set(value);
                 }
-            });
-        }
+            }
+        });
 
-        let value = reader.get();
-        assert!(value.count >= 0 && value.count <= WRITERS * WRITES)
+        let reads = (0..READS).map(|_| reader.get().count).collect::<Vec<_>>();
+
+        assert!(reads.len() == READS);
+        assert!(reads.iter().all(|&value| value >= 0));
+        assert!(reads.iter().all(|&value| value <= WRITES as i64));
+        assert!(reads.windows(2).all(|window| window[0] <= window[1]));
     });
 }
 
 #[test]
-fn writing_on_real_time_thread_with_multiple_simultaneously_readers() {
+fn writing_on_real_time_thread() {
     loom::model(|| {
         let (reader, writer) = realtime_writer(Big::default());
-        let reader = Arc::new(Mutex::new(reader));
 
-        const READERS: i64 = 2;
-        const READS: i64 = 2;
+        const READS: usize = 3;
+        const WRITES: usize = 3;
 
-        writer.set(Big::new(1));
-
-        for _ in 0..READERS {
-            thread::spawn({
-                let reader = Arc::clone(&reader);
-                move || {
-                    let mut last_read = None;
-
-                    for _ in 0..READS {
-                        let value = reader.lock().unwrap().get_ref().count;
-
-                        assert!(value == 1 || value == 2);
-                        assert!(last_read.is_none() || last_read <= Some(value));
-
-                        last_read = Some(value);
-                    }
+        thread::spawn({
+            move || {
+                for value in (0..WRITES).map(|value| Big::new(value as i64)) {
+                    writer.set(value);
                 }
-            });
-        }
+            }
+        });
 
-        writer.set(Big::new(2));
+        let reads = (0..READS).map(|_| reader.get().count).collect::<Vec<_>>();
+
+        assert!(reads.len() == READS);
+        assert!(reads.iter().all(|&value| value >= 0));
+        assert!(reads.iter().all(|&value| value <= WRITES as i64));
+        assert!(reads.windows(2).all(|window| window[0] <= window[1]));
     });
 }
 

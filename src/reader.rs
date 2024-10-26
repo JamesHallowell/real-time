@@ -1,12 +1,13 @@
 use {
     crate::{
+        backoff::Backoff,
         sync::{
             atomic::{AtomicPtr, Ordering},
             Arc,
         },
         PhantomUnsync,
     },
-    crossbeam_utils::{Backoff, CachePadded},
+    crossbeam_utils::CachePadded,
     std::{marker::PhantomData, ops::Deref, ptr::null_mut},
 };
 
@@ -136,19 +137,13 @@ impl<T> LockingWriter<T> {
 
         let new = Box::into_raw(value);
 
-        #[cfg(not(loom))]
-        let backoff = Backoff::new();
-
+        let backoff = Backoff::default();
         while self
             .shared
             .live
             .compare_exchange_weak(old, new, Ordering::SeqCst, Ordering::Relaxed)
             .is_err()
         {
-            #[cfg(loom)]
-            loom::thread::yield_now();
-
-            #[cfg(not(loom))]
             backoff.spin();
         }
 

@@ -19,3 +19,6 @@ static_assertions = "1.1.0"
 [[bench]]
 name = "reader"
 harness = false
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
