@@ -1,5 +1,6 @@
 use {
     crate::{
+        backoff::Backoff,
         sync::{
             atomic::{AtomicU8, Ordering},
             Arc,
@@ -119,12 +120,12 @@ impl<T> LockingReader<T> {
     where
         T: Send,
     {
-        let control: ControlBits = self.shared.control.load(Ordering::SeqCst).into();
+        let mut control: ControlBits = self.shared.control.load(Ordering::SeqCst).into();
 
         let read_index = control
             .is_set(ControlBit::NewData)
             .then(|| {
-                let mut control = control;
+                let backoff = Backoff::default();
                 loop {
                     // Wait until the writer has finished writing...
                     let current = control.unset(ControlBit::Busy);
@@ -148,12 +149,7 @@ impl<T> LockingReader<T> {
                         }
                         Err(actual) => {
                             control = actual.into();
-
-                            #[cfg(not(loom))]
-                            std::hint::spin_loop();
-
-                            #[cfg(loom)]
-                            loom::thread::yield_now();
+                            backoff.spin();
                         }
                     }
                 }
