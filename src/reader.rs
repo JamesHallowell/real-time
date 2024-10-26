@@ -163,10 +163,10 @@ mod test {
     };
 
     assert_impl_all!(RealtimeReader<i32>: Send);
-    assert_not_impl_all!(RealtimeReader<i32>: Sync);
+    assert_not_impl_all!(RealtimeReader<i32>: Sync, Copy, Clone);
 
     assert_impl_all!(LockingWriter<i32>: Send);
-    assert_not_impl_all!(LockingWriter<i32>: Sync);
+    assert_not_impl_all!(LockingWriter<i32>: Sync, Copy, Clone);
 
     #[test]
     fn setting_and_getting_the_shared_value() {
