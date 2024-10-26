@@ -1,59 +1,35 @@
 use {
-    criterion::{criterion_group, criterion_main, Bencher, Criterion},
+    criterion::{black_box, criterion_group, criterion_main, Bencher, Criterion},
     real_time::reader,
-    std::{
-        sync::{
-            atomic::{AtomicBool, Ordering},
-            Arc,
-        },
-        thread,
-    },
+    std::thread,
 };
 
 fn writer(bencher: &mut Bencher) {
-    let (mut writer, mut reader) = reader::realtime_reader(0);
+    let (writer, reader) = reader::realtime_reader(0);
 
-    let stop = Arc::new(AtomicBool::new(false));
-    let handle = thread::spawn({
-        let stop = Arc::clone(&stop);
+    thread::spawn({
         move || loop {
-            for _ in 0..1000 {
-                let _ = reader.get();
-            }
-            if stop.load(Ordering::Relaxed) {
-                break;
-            }
+            let value = reader.lock();
+            black_box(*value);
         }
     });
 
     bencher.iter(|| writer.set(1));
-
-    stop.store(true, Ordering::Relaxed);
-    handle.join().unwrap();
 }
 
 fn reader(bencher: &mut Bencher) {
-    let (mut writer, mut reader) = reader::realtime_reader(0);
+    let (writer, reader) = reader::realtime_reader(0);
 
-    let stop = Arc::new(AtomicBool::new(false));
-    let handle = thread::spawn({
-        let stop = Arc::clone(&stop);
+    thread::spawn({
         move || loop {
-            for _ in 0..1000 {
-                let _ = writer.set(1);
-            }
-            if stop.load(Ordering::Relaxed) {
-                break;
-            }
+            writer.set(1);
         }
     });
 
     bencher.iter(|| {
-        let _ = reader.get();
+        let value = reader.lock();
+        black_box(*value);
     });
-
-    stop.store(true, Ordering::Relaxed);
-    handle.join().unwrap();
 }
 
 fn realtime_reader_benchmark(c: &mut Criterion) {
