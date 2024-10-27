@@ -2,7 +2,7 @@
 
 use {
     loom::thread,
-    real_time::{reader::realtime_reader, writer::realtime_writer},
+    real_time::{fifo::fifo, reader::realtime_reader, writer::realtime_writer},
 };
 
 #[derive(Copy, Clone)]
@@ -77,17 +77,29 @@ fn writing_on_real_time_thread() {
 }
 
 #[test]
-fn single_consumer_single_producer_fifo() {
+fn reading_and_writing_on_different_threads() {
     loom::model(|| {
-        let (tx, rx) = real_time::fifo::fifo(1);
+        const NUM_WRITES: usize = 4;
+        let (writer, reader) = fifo(NUM_WRITES);
 
-        thread::spawn(move || {
-            assert!(tx.push(1).is_ok());
-            let _ = tx.push(2);
+        let _ = writer.push(0);
+        thread::spawn({
+            move || {
+                for value in 1..NUM_WRITES {
+                    let _ = writer.push(value);
+                }
+            }
         });
 
-        assert!(matches!(rx.pop(), None | Some(1)));
-        assert!(matches!(rx.pop(), None | Some(2)));
-        assert!(rx.pop().is_none());
-    })
+        let values = (0..NUM_WRITES)
+            .filter_map(|_| reader.pop())
+            .collect::<Vec<_>>();
+
+        assert!(!values.is_empty());
+        assert!(
+            values.windows(2).all(|window| window[0] + 1 == window[1]),
+            "{:?}",
+            values
+        );
+    });
 }

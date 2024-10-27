@@ -1,23 +1,23 @@
 use {
     crate::{
+        backoff::Backoff,
         sync::{
             atomic::{AtomicUsize, Ordering},
             Arc,
         },
-        thread,
     },
-    crossbeam_utils::{Backoff, CachePadded},
-    std::{alloc, cmp::PartialEq, marker::PhantomData, mem, ops::Deref},
+    crossbeam_utils::CachePadded,
+    std::{alloc, cmp::PartialEq, marker::PhantomData, ops::Deref},
 };
 
 /// A handle for writing values to the FIFO.
 pub struct Producer<T> {
-    buffer: Arc<Buffer<T>>,
+    shared: Arc<Shared<T>>,
 }
 
 /// A handle for reading values from the FIFO.
 pub struct Consumer<T> {
-    buffer: Arc<Buffer<T>>,
+    shared: Arc<Shared<T>>,
 }
 
 /// Create a new FIFO with the given capacity.
@@ -26,25 +26,29 @@ pub struct Consumer<T> {
 /// when they are popped, instead they will be dropped when they are overwritten by a later push,
 /// or when the buffer is dropped.
 pub fn fifo<T>(capacity: usize) -> (Producer<T>, Consumer<T>) {
-    let buffer = Arc::new(Buffer::new(capacity));
+    let shared = Arc::new(Shared::new(capacity));
 
     (
         Producer {
-            buffer: Arc::clone(&buffer),
+            shared: Arc::clone(&shared),
         },
-        Consumer { buffer },
+        Consumer { shared },
     )
 }
 
 unsafe impl<T> Send for Producer<T> where T: Send {}
 unsafe impl<T> Send for Consumer<T> where T: Send {}
 
-struct Buffer<T> {
-    data: *mut T,
+struct Shared<T> {
     capacity: usize,
-    allocated_capacity: usize,
+    buffer: Buffer<T>,
     head: CachePadded<AtomicUsize>,
     tail: CachePadded<AtomicUsize>,
+}
+
+struct Buffer<T> {
+    ptr: *mut T,
+    len: usize,
 }
 
 impl<T> Producer<T> {
@@ -52,19 +56,11 @@ impl<T> Producer<T> {
     ///
     /// If the FIFO is full, this method will block until there is space available.
     pub fn push_blocking(&self, mut value: T) {
-        let backoff = Backoff::new();
+        let backoff = Backoff::default();
 
-        loop {
-            value = match self.push(value) {
-                Ok(()) => return,
-                Err(value) => value,
-            };
-
-            if backoff.is_completed() {
-                thread::park();
-            } else {
-                backoff.snooze();
-            }
+        while let Err(value_failed_to_push) = self.push(value) {
+            backoff.snooze();
+            value = value_failed_to_push;
         }
     }
 
@@ -72,20 +68,28 @@ impl<T> Producer<T> {
     ///
     /// If the FIFO is full, this method will not block, and instead returns the value to the caller.
     pub fn push(&self, value: T) -> Result<(), T> {
-        let tail = self.buffer.get_tail(Ordering::Relaxed);
-        let head = self.buffer.get_head(Ordering::Acquire);
+        let tail = self.shared.get(Ordering::Relaxed);
+        let head = self.shared.get(Ordering::Acquire);
 
-        if self.buffer.is_full(head, tail) {
+        let size = self.shared.size(head, tail);
+        assert!(
+            size <= self.shared.capacity,
+            "size ({}) should not be greater than capacity ({})",
+            size,
+            self.shared.capacity
+        );
+
+        if size == self.shared.capacity {
             return Err(value);
         }
 
-        let ptr = self.buffer.element(tail);
-        if usize::from(tail) >= self.buffer.allocated_capacity {
-            unsafe { ptr.drop_in_place() };
+        let element = self.shared.element(tail);
+        if self.shared.has_wrapped_around(tail) {
+            unsafe { element.drop_in_place() };
         }
-        unsafe { ptr.write(value) };
+        unsafe { element.write(value) };
 
-        self.buffer.increment_tail(tail, Ordering::Release);
+        self.shared.advance(tail, Ordering::Release);
         Ok(())
     }
 }
@@ -103,14 +107,23 @@ impl<T> Consumer<T> {
     ///
     /// This method is useful when the elements in the FIFO do not implement `Copy`.
     pub fn pop_ref(&self) -> Option<PopRef<'_, T>> {
-        let tail = self.buffer.get_tail(Ordering::Acquire);
-        let head = self.buffer.get_head(Ordering::Relaxed);
+        let head = self.shared.get(Ordering::Relaxed);
+        let tail = self.shared.get(Ordering::Acquire);
 
-        if self.buffer.is_empty(head, tail) {
+        let size = self.shared.size(head, tail);
+        assert!(
+            size <= self.shared.capacity,
+            "size ({}) should not be greater than capacity ({})",
+            size,
+            self.shared.capacity
+        );
+
+        if size == 0 {
             return None;
         }
 
-        let value = unsafe { &*self.buffer.element(head) };
+        let element = self.shared.element(head);
+        let value = unsafe { &*element };
 
         Some(PopRef {
             head,
@@ -120,96 +133,121 @@ impl<T> Consumer<T> {
     }
 }
 
-impl<T> Buffer<T> {
+impl<T> Shared<T> {
     fn new(capacity: usize) -> Self {
-        let layout = layout_for::<T>(capacity);
+        Self {
+            capacity,
+            buffer: Buffer::new(capacity),
+            head: CachePadded::new(AtomicUsize::new(0)),
+            tail: CachePadded::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn size(&self, head: Head, tail: Tail) -> usize {
+        size(head, tail, self.buffer.len)
+    }
+
+    fn index<Role>(&self, cursor: Cursor<Role>) -> usize {
+        index(cursor, self.buffer.len)
+    }
+
+    fn element<Role>(&self, cursor: Cursor<Role>) -> *mut T {
+        self.buffer.at(self.index(cursor))
+    }
+
+    fn has_wrapped_around<Role>(&self, Cursor(pos, _): Cursor<Role>) -> bool {
+        pos >= self.buffer.len
+    }
+
+    fn advance<Role>(&self, cursor: Cursor<Role>, ordering: Ordering)
+    where
+        Self: SetCursor<Role>,
+    {
+        self.set(advance(cursor, self.buffer.len), ordering);
+    }
+}
+
+trait SetCursor<Role> {
+    fn set(&self, cursor: Cursor<Role>, ordering: Ordering);
+}
+
+impl<T> SetCursor<HeadRole> for Shared<T> {
+    fn set(&self, head: Head, ordering: Ordering) {
+        self.head.store(head.into(), ordering);
+    }
+}
+
+impl<T> SetCursor<TailRole> for Shared<T> {
+    fn set(&self, tail: Tail, ordering: Ordering) {
+        self.tail.store(tail.into(), ordering);
+    }
+}
+
+trait GetCursor<Role> {
+    fn get(&self, ordering: Ordering) -> Cursor<Role>;
+}
+
+impl<T> GetCursor<HeadRole> for Shared<T> {
+    fn get(&self, ordering: Ordering) -> Head {
+        self.head.load(ordering).into()
+    }
+}
+
+impl<T> GetCursor<TailRole> for Shared<T> {
+    fn get(&self, ordering: Ordering) -> Tail {
+        self.tail.load(ordering).into()
+    }
+}
+
+impl<T> Drop for Shared<T> {
+    fn drop(&mut self) {
+        let tail: Tail = self.get(Ordering::Relaxed);
+
+        let elements_to_drop = if self.has_wrapped_around(tail) {
+            self.buffer.len
+        } else {
+            tail.into()
+        };
+
+        for i in 0..elements_to_drop {
+            let element = self.buffer.at(i);
+            unsafe { element.drop_in_place() };
+        }
+    }
+}
+
+impl<T> Buffer<T> {
+    fn new(size: usize) -> Self {
+        let size = size.next_power_of_two();
+        let layout = layout_for::<T>(size);
+
         let buffer = unsafe { alloc::alloc(layout) };
         if buffer.is_null() {
             panic!("failed to allocate buffer");
         }
 
         Self {
-            data: buffer.cast(),
-            capacity,
-            allocated_capacity: capacity.next_power_of_two(),
-            head: CachePadded::new(AtomicUsize::new(0)),
-            tail: CachePadded::new(AtomicUsize::new(0)),
+            ptr: buffer.cast(),
+            len: size,
         }
     }
 
-    fn get_head(&self, ordering: Ordering) -> Head {
-        self.head.load(ordering).into()
-    }
-
-    fn get_tail(&self, ordering: Ordering) -> Tail {
-        self.tail.load(ordering).into()
-    }
-
-    fn increment_head(&self, head: Head, ordering: Ordering) {
-        let head = self.increment(head);
-        self.head.store(head.into(), ordering);
-    }
-
-    fn increment_tail(&self, tail: Tail, ordering: Ordering) {
-        let tail = self.increment(tail);
-        self.tail.store(tail.into(), ordering);
-    }
-
-    fn size(&self, head: Head, tail: Tail) -> usize {
-        self.index(tail).saturating_sub(self.index(head)) as usize
-    }
-
-    fn is_empty(&self, head: Head, tail: Tail) -> bool {
-        head == tail
-    }
-
-    fn is_full(&self, head: Head, tail: Tail) -> bool {
-        self.size(head, tail) == self.capacity
-    }
-
-    fn element<Role>(&self, cursor: Cursor<Role>) -> *mut T {
-        unsafe { self.data.offset(self.index(cursor)) }
-    }
-
-    fn index<Role>(&self, Cursor(cursor, _): Cursor<Role>) -> isize {
-        (cursor & (self.allocated_capacity - 1)) as isize
-    }
-
-    fn increment<Role>(&self, Cursor(cursor, _): Cursor<Role>) -> Cursor<Role> {
-        match cursor.checked_add(1) {
-            Some(cursor) => cursor,
-            None => (cursor % self.allocated_capacity) + self.allocated_capacity + 1,
-        }
-        .into()
+    fn at(&self, index: usize) -> *mut T {
+        debug_assert!(index < self.len, "index out of bounds");
+        unsafe { self.ptr.add(index) }
     }
 }
 
 impl<T> Drop for Buffer<T> {
     fn drop(&mut self) {
-        let tail = self.get_tail(Ordering::Relaxed).into();
-        let n = if tail < self.allocated_capacity {
-            tail
-        } else {
-            self.allocated_capacity
-        };
-
-        for i in 0..n {
-            let ptr = unsafe { self.data.add(i) };
-            unsafe { ptr.drop_in_place() };
-        }
-
-        let layout = layout_for::<T>(self.capacity);
-        unsafe { alloc::dealloc(self.data.cast(), layout) };
+        let layout = layout_for::<T>(self.len);
+        unsafe { alloc::dealloc(self.ptr.cast(), layout) };
     }
 }
 
-fn layout_for<T>(capacity: usize) -> alloc::Layout {
-    let bytes = capacity
-        .next_power_of_two()
-        .checked_mul(mem::size_of::<T>())
-        .expect("capacity overflow");
-
-    alloc::Layout::from_size_align(bytes, mem::align_of::<T>()).expect("failed to create layout")
+fn layout_for<T>(size: usize) -> alloc::Layout {
+    let bytes = size.checked_mul(size_of::<T>()).expect("capacity overflow");
+    alloc::Layout::from_size_align(bytes, align_of::<T>()).expect("failed to create layout")
 }
 
 /// A reference to a value that has been popped from the FIFO.
@@ -229,14 +267,44 @@ impl<T> Deref for PopRef<'_, T> {
 
 impl<T> Drop for PopRef<'_, T> {
     fn drop(&mut self) {
-        self.consumer
-            .buffer
-            .increment_head(self.head, Ordering::Release);
+        self.consumer.shared.advance(self.head, Ordering::Release);
     }
 }
 
 #[derive(Debug, Copy, Clone)]
 struct Cursor<Role>(usize, PhantomData<Role>);
+
+fn size(head: Head, tail: Tail, size: usize) -> usize {
+    if head == tail {
+        return 0;
+    }
+
+    let head = index(head, size);
+    let tail = index(tail, size);
+
+    if head < tail {
+        tail - head
+    } else {
+        size - head + tail
+    }
+}
+
+fn advance<Role>(Cursor(cursor, _): Cursor<Role>, size: usize) -> Cursor<Role> {
+    match cursor.checked_add(1) {
+        Some(cursor) => cursor,
+        None => (cursor % size) + size + 1,
+    }
+    .into()
+}
+
+fn index<Role>(Cursor(cursor, _): Cursor<Role>, size: usize) -> usize {
+    debug_assert!(
+        size.is_power_of_two(),
+        "size must be a power of two, got {size:?}",
+    );
+
+    cursor & (size - 1)
+}
 
 #[derive(Debug, Copy, Clone)]
 struct HeadRole;
@@ -254,6 +322,12 @@ impl<RoleA, RoleB> PartialEq<Cursor<RoleA>> for Cursor<RoleB> {
     }
 }
 
+impl<RoleA, RoleB> PartialOrd<Cursor<RoleA>> for Cursor<RoleB> {
+    fn partial_cmp(&self, other: &Cursor<RoleA>) -> Option<std::cmp::Ordering> {
+        self.0.partial_cmp(&other.0)
+    }
+}
+
 impl<Role> From<usize> for Cursor<Role> {
     fn from(value: usize) -> Self {
         Cursor(value, PhantomData)
@@ -268,12 +342,13 @@ impl<Role> From<Cursor<Role>> for usize {
 
 #[cfg(test)]
 mod test {
-    use super::*;
+    use {super::*, std::thread};
 
-    fn size<T>(producer: &Producer<T>) -> usize {
-        producer.buffer.size(
-            producer.buffer.get_head(Ordering::Relaxed),
-            producer.buffer.get_tail(Ordering::Relaxed),
+    fn get_buffer_size<T>(producer: &Producer<T>) -> usize {
+        size(
+            producer.shared.get(Ordering::Relaxed),
+            producer.shared.get(Ordering::Relaxed),
+            producer.shared.buffer.len,
         )
     }
 
@@ -292,6 +367,78 @@ mod test {
         }
     }
 
+    fn head(pos: usize) -> Head {
+        Cursor(pos, PhantomData)
+    }
+
+    fn tail(pos: usize) -> Tail {
+        Cursor(pos, PhantomData)
+    }
+
+    #[test]
+    fn querying_size() {
+        assert_eq!(size(head(0), tail(0), 4), 0);
+        assert_eq!(size(head(0), tail(1), 4), 1);
+        assert_eq!(size(head(0), tail(2), 4), 2);
+        assert_eq!(size(head(0), tail(3), 4), 3);
+        assert_eq!(size(head(1), tail(3), 4), 2);
+        assert_eq!(size(head(2), tail(3), 4), 1);
+        assert_eq!(size(head(3), tail(3), 4), 0);
+    }
+
+    #[test]
+    fn advancing_cursors() {
+        let cursor = head(0);
+
+        let cursor = advance(cursor, 4);
+        assert_eq!(cursor, head(1));
+
+        let cursor = advance(cursor, 4);
+        assert_eq!(cursor, head(2));
+
+        let cursor = advance(cursor, 4);
+        assert_eq!(cursor, head(3));
+
+        let cursor = advance(cursor, 4);
+        assert_eq!(cursor, head(4));
+
+        let cursor = advance(cursor, 4);
+        assert_eq!(cursor, head(5));
+    }
+
+    #[test]
+    fn cursor_overflow() {
+        for capacity in [2, 4, 8, 16, 32, 64, 128, 256, 512, 1024] {
+            let head = head(usize::MAX - capacity);
+            let tail = tail(usize::MAX);
+
+            assert_eq!(size(head, tail, capacity), capacity);
+
+            let head = advance(head, capacity);
+
+            assert_eq!(size(head, tail, capacity), capacity - 1);
+
+            assert!(head < tail);
+            let tail = advance(tail, capacity);
+            assert!(tail < head);
+
+            assert_eq!(size(head, tail, capacity), capacity);
+        }
+    }
+
+    #[test]
+    fn cursor_to_index() {
+        assert_eq!(index(head(0), 4), 0);
+        assert_eq!(index(head(1), 4), 1);
+        assert_eq!(index(head(2), 4), 2);
+        assert_eq!(index(head(3), 4), 3);
+        assert_eq!(index(head(4), 4), 0);
+        assert_eq!(index(head(5), 4), 1);
+        assert_eq!(index(head(6), 4), 2);
+        assert_eq!(index(head(7), 4), 3);
+        assert_eq!(index(head(8), 4), 0);
+    }
+
     #[beady::scenario]
     #[test]
     fn using_a_fifo() {
@@ -299,7 +446,7 @@ mod test {
             let (tx, rx) = fifo::<i32>(3);
 
             'then_the_fifo_starts_empty: {
-                assert_eq!(size(&tx), 0);
+                assert_eq!(get_buffer_size(&tx), 0);
             }
 
             'when_we_try_to_pop_a_value: {
@@ -423,26 +570,55 @@ mod test {
 
     #[test]
     fn cursors_wrap_around_and_start_at_the_allocated_capacity() {
-        for capacity in 0..1024 {
-            let (tx, _rx) = fifo::<i32>(capacity);
+        const BEFORE_OVERFLOW: Tail = Cursor(usize::MAX - 1, PhantomData);
+        const OVERFLOW: Tail = Cursor(usize::MAX, PhantomData);
 
-            const BEFORE_OVERFLOW: Head = Cursor(usize::MAX - 1, PhantomData);
-            const OVERFLOW: Head = Cursor(usize::MAX, PhantomData);
+        for capacity in (0..=1024).map(|capacity: usize| capacity.next_power_of_two()) {
+            let prev_tail = advance(BEFORE_OVERFLOW, capacity);
+            let prev_tail_index = index(prev_tail, capacity);
 
-            let prev_head = tx.buffer.increment(BEFORE_OVERFLOW);
-            let prev_head_index = tx.buffer.index(prev_head);
+            let next_tail = advance(OVERFLOW, capacity);
+            let next_tail_index = index(next_tail, capacity);
 
-            let next_head = tx.buffer.increment(OVERFLOW);
-            let next_head_index = tx.buffer.index(next_head);
-
+            // The wrapped cursor should not reuse the values between [0, allocated_capacity)
+            // because they are used to determine if elements can be safely dropped.
             assert!(
-                next_head.0 >= tx.buffer.allocated_capacity,
+                next_tail.0 >= capacity,
                 "the wrapped cursor should not reuse the values between [0, allocated_capacity)"
             );
-            assert_eq!(
-                next_head_index,
-                (prev_head_index + 1) % tx.buffer.allocated_capacity as isize
-            );
+            assert_eq!(next_tail_index, (prev_tail_index + 1) % capacity);
+        }
+    }
+
+    #[test]
+    fn reading_and_writing_on_different_threads() {
+        let (writer, reader) = fifo(12);
+
+        #[cfg(miri)]
+        const NUM_WRITES: usize = 128;
+
+        #[cfg(not(miri))]
+        const NUM_WRITES: usize = 1_000_000;
+
+        thread::spawn({
+            move || {
+                for value in 1..=NUM_WRITES {
+                    writer.push_blocking(value);
+                }
+            }
+        });
+
+        let mut last = None;
+        while last != Some(NUM_WRITES) {
+            match reader.pop() {
+                Some(value) => {
+                    if let Some(last) = last {
+                        assert_eq!(last + 1, value, "values should be popped in order");
+                    }
+                    last = Some(value);
+                }
+                None => thread::yield_now(),
+            }
         }
     }
 }
