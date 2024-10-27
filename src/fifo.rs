@@ -7,17 +7,17 @@ use {
         },
     },
     crossbeam_utils::CachePadded,
-    std::{alloc, cmp::PartialEq, marker::PhantomData, ops::Deref},
+    std::{alloc, cell::UnsafeCell, cmp::PartialEq, marker::PhantomData, ops::Deref},
 };
 
 /// A handle for writing values to the FIFO.
-pub struct Producer<T> {
-    shared: Arc<Shared<T>>,
+pub struct Producer<T, const N: usize> {
+    shared: Arc<Shared<T, N>>,
 }
 
 /// A handle for reading values from the FIFO.
-pub struct Consumer<T> {
-    shared: Arc<Shared<T>>,
+pub struct Consumer<T, const N: usize> {
+    shared: Arc<Shared<T, N>>,
 }
 
 /// Create a new FIFO with the given capacity.
@@ -25,8 +25,8 @@ pub struct Consumer<T> {
 /// This FIFO is optimised for a consumer running on a real-time thread. Elements are not dropped
 /// when they are popped, instead they will be dropped when they are overwritten by a later push,
 /// or when the buffer is dropped.
-pub fn fifo<T>(capacity: usize) -> (Producer<T>, Consumer<T>) {
-    let shared = Arc::new(Shared::new(capacity));
+pub fn fifo<T, const N: usize>() -> (Producer<T, N>, Consumer<T, N>) {
+    let shared = Arc::new(Shared::new());
 
     (
         Producer {
@@ -36,22 +36,22 @@ pub fn fifo<T>(capacity: usize) -> (Producer<T>, Consumer<T>) {
     )
 }
 
-unsafe impl<T> Send for Producer<T> where T: Send {}
-unsafe impl<T> Send for Consumer<T> where T: Send {}
+unsafe impl<T, const N: usize> Send for Producer<T, N> where T: Send {}
+unsafe impl<T, const N: usize> Send for Consumer<T, N> where T: Send {}
 
-struct Shared<T> {
-    capacity: usize,
-    buffer: Buffer<T>,
-    head: CachePadded<AtomicUsize>,
-    tail: CachePadded<AtomicUsize>,
+struct Shared<T, const N: usize> {
+    buffer: Buffer<T, N>,
+    atomic_head: CachePadded<AtomicHead>,
+    cached_tail: CachePadded<CachedTail>,
+    cached_head: CachePadded<CachedHead>,
+    atomic_tail: CachePadded<AtomicTail>,
 }
 
-struct Buffer<T> {
+struct Buffer<T, const N: usize> {
     ptr: *mut T,
-    len: usize,
 }
 
-impl<T> Producer<T> {
+impl<T, const N: usize> Producer<T, N> {
     /// Push a value into the FIFO.
     ///
     /// If the FIFO is full, this method will block until there is space available.
@@ -69,32 +69,40 @@ impl<T> Producer<T> {
     /// If the FIFO is full, this method will not block, and instead returns the value to the caller.
     pub fn push(&self, value: T) -> Result<(), T> {
         let tail = self.shared.get(Ordering::Relaxed);
-        let head = self.shared.get(Ordering::Acquire);
+        let head = self.shared.get_cached();
 
-        let size = self.shared.size(head, tail);
-        assert!(
-            size <= self.shared.capacity,
+        let size = match size(head, tail) {
+            size if size < N => size,
+            _ => {
+                let head = self.shared.get(Ordering::Acquire);
+                self.shared.set_cached(head);
+                size(head, tail)
+            }
+        };
+
+        debug_assert!(
+            size <= Buffer::<T, N>::SIZE,
             "size ({}) should not be greater than capacity ({})",
             size,
-            self.shared.capacity
+            Buffer::<T, N>::SIZE
         );
 
-        if size == self.shared.capacity {
+        if size == N {
             return Err(value);
         }
 
-        let element = self.shared.element(tail);
-        if self.shared.has_wrapped_around(tail) {
+        let element = self.shared.buffer.get(tail);
+        if self.shared.buffer.has_wrapped(tail) {
             unsafe { element.drop_in_place() };
         }
         unsafe { element.write(value) };
 
-        self.shared.advance(tail, Ordering::Release);
+        self.shared.set(advance(tail), Ordering::Release);
         Ok(())
     }
 }
 
-impl<T> Consumer<T> {
+impl<T, const N: usize> Consumer<T, N> {
     /// Pop a value from the FIFO.
     pub fn pop(&self) -> Option<T>
     where
@@ -106,23 +114,31 @@ impl<T> Consumer<T> {
     /// Pop a value from the FIFO by reference.
     ///
     /// This method is useful when the elements in the FIFO do not implement `Copy`.
-    pub fn pop_ref(&self) -> Option<PopRef<'_, T>> {
+    pub fn pop_ref(&self) -> Option<PopRef<'_, T, N>> {
         let head = self.shared.get(Ordering::Relaxed);
-        let tail = self.shared.get(Ordering::Acquire);
+        let tail = self.shared.get_cached();
 
-        let size = self.shared.size(head, tail);
-        assert!(
-            size <= self.shared.capacity,
+        let size = match size(head, tail) {
+            0 => {
+                let tail = self.shared.get(Ordering::Acquire);
+                self.shared.set_cached(tail);
+                size(head, tail)
+            }
+            size => size,
+        };
+
+        debug_assert!(
+            size <= Buffer::<T, N>::SIZE,
             "size ({}) should not be greater than capacity ({})",
             size,
-            self.shared.capacity
+            Buffer::<T, N>::SIZE
         );
 
         if size == 0 {
             return None;
         }
 
-        let element = self.shared.element(head);
+        let element = self.shared.buffer.get(head);
         let value = unsafe { &*element };
 
         Some(PopRef {
@@ -133,78 +149,82 @@ impl<T> Consumer<T> {
     }
 }
 
-impl<T> Shared<T> {
-    fn new(capacity: usize) -> Self {
+impl<T, const N: usize> Shared<T, N> {
+    fn new() -> Self {
         Self {
-            capacity,
-            buffer: Buffer::new(capacity),
-            head: CachePadded::new(AtomicUsize::new(0)),
-            tail: CachePadded::new(AtomicUsize::new(0)),
+            buffer: Buffer::new(),
+            atomic_head: CachePadded::default(),
+            cached_tail: CachePadded::default(),
+            cached_head: CachePadded::default(),
+            atomic_tail: CachePadded::default(),
         }
-    }
-
-    fn size(&self, head: Head, tail: Tail) -> usize {
-        size(head, tail, self.buffer.len)
-    }
-
-    fn index<Role>(&self, cursor: Cursor<Role>) -> usize {
-        index(cursor, self.buffer.len)
-    }
-
-    fn element<Role>(&self, cursor: Cursor<Role>) -> *mut T {
-        self.buffer.at(self.index(cursor))
-    }
-
-    fn has_wrapped_around<Role>(&self, Cursor(pos, _): Cursor<Role>) -> bool {
-        pos >= self.buffer.len
-    }
-
-    fn advance<Role>(&self, cursor: Cursor<Role>, ordering: Ordering)
-    where
-        Self: SetCursor<Role>,
-    {
-        self.set(advance(cursor, self.buffer.len), ordering);
     }
 }
 
 trait SetCursor<Role> {
     fn set(&self, cursor: Cursor<Role>, ordering: Ordering);
+    fn set_cached(&self, cursor: Cursor<Role>);
 }
 
-impl<T> SetCursor<HeadRole> for Shared<T> {
-    fn set(&self, head: Head, ordering: Ordering) {
-        self.head.store(head.into(), ordering);
+impl<T, const N: usize> SetCursor<HeadRole> for Shared<T, N> {
+    #[inline]
+    fn set(&self, cursor: Head, ordering: Ordering) {
+        self.atomic_head.store(cursor, ordering);
+    }
+
+    #[inline]
+    fn set_cached(&self, cursor: Head) {
+        self.cached_head.set(cursor);
     }
 }
 
-impl<T> SetCursor<TailRole> for Shared<T> {
-    fn set(&self, tail: Tail, ordering: Ordering) {
-        self.tail.store(tail.into(), ordering);
+impl<T, const N: usize> SetCursor<TailRole> for Shared<T, N> {
+    #[inline]
+    fn set(&self, cursor: Tail, ordering: Ordering) {
+        self.atomic_tail.store(cursor, ordering);
+    }
+
+    #[inline]
+    fn set_cached(&self, cursor: Tail) {
+        self.cached_tail.set(cursor);
     }
 }
 
 trait GetCursor<Role> {
     fn get(&self, ordering: Ordering) -> Cursor<Role>;
+    fn get_cached(&self) -> Cursor<Role>;
 }
 
-impl<T> GetCursor<HeadRole> for Shared<T> {
+impl<T, const N: usize> GetCursor<HeadRole> for Shared<T, N> {
+    #[inline]
     fn get(&self, ordering: Ordering) -> Head {
-        self.head.load(ordering).into()
+        self.atomic_head.load(ordering)
+    }
+
+    #[inline]
+    fn get_cached(&self) -> Head {
+        self.cached_head.get()
     }
 }
 
-impl<T> GetCursor<TailRole> for Shared<T> {
+impl<T, const N: usize> GetCursor<TailRole> for Shared<T, N> {
+    #[inline]
     fn get(&self, ordering: Ordering) -> Tail {
-        self.tail.load(ordering).into()
+        self.atomic_tail.load(ordering)
+    }
+
+    #[inline]
+    fn get_cached(&self) -> Tail {
+        self.cached_tail.get()
     }
 }
 
-impl<T> Drop for Shared<T> {
+impl<T, const N: usize> Drop for Shared<T, N> {
     fn drop(&mut self) {
         let tail: Tail = self.get(Ordering::Relaxed);
 
-        let elements_to_drop = if self.has_wrapped_around(tail) {
-            self.buffer.len
+        let elements_to_drop = if self.buffer.has_wrapped(tail) {
+            Buffer::<T, N>::SIZE
         } else {
             tail.into()
         };
@@ -216,31 +236,45 @@ impl<T> Drop for Shared<T> {
     }
 }
 
-impl<T> Buffer<T> {
-    fn new(size: usize) -> Self {
-        let size = size.next_power_of_two();
-        let layout = layout_for::<T>(size);
+impl<T, const N: usize> Buffer<T, N> {
+    const SIZE: usize = usize::next_power_of_two(N);
+
+    fn new() -> Self {
+        let layout = layout_for::<T>(Self::SIZE);
 
         let buffer = unsafe { alloc::alloc(layout) };
         if buffer.is_null() {
             panic!("failed to allocate buffer");
         }
 
-        Self {
-            ptr: buffer.cast(),
-            len: size,
-        }
+        Self { ptr: buffer.cast() }
     }
 
+    #[inline]
     fn at(&self, index: usize) -> *mut T {
-        debug_assert!(index < self.len, "index out of bounds");
+        debug_assert!(index < Self::SIZE, "index out of bounds");
         unsafe { self.ptr.add(index) }
+    }
+
+    #[inline]
+    fn index<Role>(&self, cursor: Cursor<Role>) -> usize {
+        index(cursor, Self::SIZE)
+    }
+
+    #[inline]
+    fn get<Role>(&self, cursor: Cursor<Role>) -> *mut T {
+        self.at(self.index(cursor))
+    }
+
+    #[inline]
+    fn has_wrapped<Role>(&self, Cursor(pos, _): Cursor<Role>) -> bool {
+        pos >= Buffer::<T, N>::SIZE
     }
 }
 
-impl<T> Drop for Buffer<T> {
+impl<T, const N: usize> Drop for Buffer<T, N> {
     fn drop(&mut self) {
-        let layout = layout_for::<T>(self.len);
+        let layout = layout_for::<T>(Self::SIZE);
         unsafe { alloc::dealloc(self.ptr.cast(), layout) };
     }
 }
@@ -251,13 +285,13 @@ fn layout_for<T>(size: usize) -> alloc::Layout {
 }
 
 /// A reference to a value that has been popped from the FIFO.
-pub struct PopRef<'a, T> {
+pub struct PopRef<'a, T, const N: usize> {
     head: Head,
     value: &'a T,
-    consumer: &'a Consumer<T>,
+    consumer: &'a Consumer<T, N>,
 }
 
-impl<T> Deref for PopRef<'_, T> {
+impl<T, const N: usize> Deref for PopRef<'_, T, N> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -265,44 +299,79 @@ impl<T> Deref for PopRef<'_, T> {
     }
 }
 
-impl<T> Drop for PopRef<'_, T> {
+impl<T, const N: usize> Drop for PopRef<'_, T, N> {
     fn drop(&mut self) {
-        self.consumer.shared.advance(self.head, Ordering::Release);
+        self.consumer
+            .shared
+            .set(advance(self.head), Ordering::Release);
     }
 }
 
+#[repr(transparent)]
 #[derive(Debug, Copy, Clone)]
 struct Cursor<Role>(usize, PhantomData<Role>);
 
-fn size(head: Head, tail: Tail, size: usize) -> usize {
-    if head == tail {
-        return 0;
-    }
+#[repr(transparent)]
+struct AtomicCursor<Role>(AtomicUsize, PhantomData<Role>);
 
-    let head = index(head, size);
-    let tail = index(tail, size);
-
-    if head < tail {
-        tail - head
-    } else {
-        size - head + tail
+impl<Role> Default for AtomicCursor<Role> {
+    fn default() -> Self {
+        Self(AtomicUsize::new(0), PhantomData)
     }
 }
 
-fn advance<Role>(Cursor(cursor, _): Cursor<Role>, size: usize) -> Cursor<Role> {
-    match cursor.checked_add(1) {
-        Some(cursor) => cursor,
-        None => (cursor % size) + size + 1,
+impl<Role> AtomicCursor<Role> {
+    #[inline]
+    fn load(&self, ordering: Ordering) -> Cursor<Role> {
+        Cursor(self.0.load(ordering), PhantomData)
     }
-    .into()
+
+    #[inline]
+    fn store(&self, Cursor(cursor, _): Cursor<Role>, ordering: Ordering) {
+        self.0.store(cursor, ordering);
+    }
 }
 
+#[repr(transparent)]
+struct CachedCursor<Role>(UnsafeCell<Cursor<Role>>);
+
+impl<Role> Default for CachedCursor<Role> {
+    fn default() -> Self {
+        Self(UnsafeCell::new(Cursor(0, PhantomData)))
+    }
+}
+
+impl<Role> CachedCursor<Role> {
+    #[inline]
+    fn get(&self) -> Cursor<Role>
+    where
+        Cursor<Role>: Copy,
+    {
+        unsafe { *self.0.get() }
+    }
+
+    #[inline]
+    fn set(&self, cursor: Cursor<Role>) {
+        unsafe { *self.0.get() = cursor }
+    }
+}
+
+#[inline]
+fn size(Cursor(head, _): Head, Cursor(tail, _): Tail) -> usize {
+    tail - head
+}
+
+#[inline]
+fn advance<Role>(Cursor(cursor, _): Cursor<Role>) -> Cursor<Role> {
+    Cursor(cursor + 1, PhantomData)
+}
+
+#[inline]
 fn index<Role>(Cursor(cursor, _): Cursor<Role>, size: usize) -> usize {
     debug_assert!(
         size.is_power_of_two(),
         "size must be a power of two, got {size:?}",
     );
-
     cursor & (size - 1)
 }
 
@@ -315,6 +384,14 @@ struct TailRole;
 type Head = Cursor<HeadRole>;
 
 type Tail = Cursor<TailRole>;
+
+type AtomicHead = AtomicCursor<HeadRole>;
+
+type AtomicTail = AtomicCursor<TailRole>;
+
+type CachedHead = CachedCursor<HeadRole>;
+
+type CachedTail = CachedCursor<TailRole>;
 
 impl<RoleA, RoleB> PartialEq<Cursor<RoleA>> for Cursor<RoleB> {
     fn eq(&self, other: &Cursor<RoleA>) -> bool {
@@ -344,11 +421,10 @@ impl<Role> From<Cursor<Role>> for usize {
 mod test {
     use {super::*, std::thread};
 
-    fn get_buffer_size<T>(producer: &Producer<T>) -> usize {
+    fn get_buffer_size<T, const N: usize>(producer: &Producer<T, N>) -> usize {
         size(
             producer.shared.get(Ordering::Relaxed),
             producer.shared.get(Ordering::Relaxed),
-            producer.shared.buffer.len,
         )
     }
 
@@ -377,53 +453,33 @@ mod test {
 
     #[test]
     fn querying_size() {
-        assert_eq!(size(head(0), tail(0), 4), 0);
-        assert_eq!(size(head(0), tail(1), 4), 1);
-        assert_eq!(size(head(0), tail(2), 4), 2);
-        assert_eq!(size(head(0), tail(3), 4), 3);
-        assert_eq!(size(head(1), tail(3), 4), 2);
-        assert_eq!(size(head(2), tail(3), 4), 1);
-        assert_eq!(size(head(3), tail(3), 4), 0);
+        assert_eq!(size(head(0), tail(0)), 0);
+        assert_eq!(size(head(0), tail(1)), 1);
+        assert_eq!(size(head(0), tail(2)), 2);
+        assert_eq!(size(head(0), tail(3)), 3);
+        assert_eq!(size(head(1), tail(3)), 2);
+        assert_eq!(size(head(2), tail(3)), 1);
+        assert_eq!(size(head(3), tail(3)), 0);
     }
 
     #[test]
     fn advancing_cursors() {
         let cursor = head(0);
 
-        let cursor = advance(cursor, 4);
+        let cursor = advance(cursor);
         assert_eq!(cursor, head(1));
 
-        let cursor = advance(cursor, 4);
+        let cursor = advance(cursor);
         assert_eq!(cursor, head(2));
 
-        let cursor = advance(cursor, 4);
+        let cursor = advance(cursor);
         assert_eq!(cursor, head(3));
 
-        let cursor = advance(cursor, 4);
+        let cursor = advance(cursor);
         assert_eq!(cursor, head(4));
 
-        let cursor = advance(cursor, 4);
+        let cursor = advance(cursor);
         assert_eq!(cursor, head(5));
-    }
-
-    #[test]
-    fn cursor_overflow() {
-        for capacity in [2, 4, 8, 16, 32, 64, 128, 256, 512, 1024] {
-            let head = head(usize::MAX - capacity);
-            let tail = tail(usize::MAX);
-
-            assert_eq!(size(head, tail, capacity), capacity);
-
-            let head = advance(head, capacity);
-
-            assert_eq!(size(head, tail, capacity), capacity - 1);
-
-            assert!(head < tail);
-            let tail = advance(tail, capacity);
-            assert!(tail < head);
-
-            assert_eq!(size(head, tail, capacity), capacity);
-        }
     }
 
     #[test]
@@ -439,96 +495,41 @@ mod test {
         assert_eq!(index(head(8), 4), 0);
     }
 
-    #[beady::scenario]
     #[test]
     fn using_a_fifo() {
-        'given_an_empty_fifo: {
-            let (tx, rx) = fifo::<i32>(3);
+        let (tx, rx) = fifo::<i32, 3>();
+        assert_eq!(get_buffer_size(&tx), 0);
 
-            'then_the_fifo_starts_empty: {
-                assert_eq!(get_buffer_size(&tx), 0);
-            }
+        assert!(rx.pop().is_none());
 
-            'when_we_try_to_pop_a_value: {
-                let value = rx.pop();
+        tx.push(5).unwrap();
 
-                'then_nothing_is_returned: {
-                    assert!(value.is_none());
-                }
-            }
+        assert_eq!(rx.pop(), Some(5));
 
-            'when_we_push_a_value: {
-                tx.push(5).unwrap();
+        tx.push(1).unwrap();
+        tx.push(2).unwrap();
+        tx.push(3).unwrap();
 
-                'and_when_we_try_to_pop_a_value: {
-                    let value = rx.pop();
+        let push_result = tx.push(4);
+        assert_eq!(push_result, Err(4));
 
-                    'then_the_popped_value_is_the_one_that_was_pushed: {
-                        assert_eq!(value, Some(5));
-                    }
-                }
-            }
+        assert_eq!(rx.pop(), Some(1));
 
-            'when_the_fifo_is_at_capacity: {
-                tx.push(1).unwrap();
-                tx.push(2).unwrap();
-                tx.push(3).unwrap();
+        let push_result = tx.push(4);
+        assert!(push_result.is_ok());
 
-                'and_when_we_try_to_push_another_value: {
-                    let push_result = tx.push(4);
+        let (tx, rx) = fifo::<String, 2>();
+        tx.push("hello".to_string()).unwrap();
 
-                    'then_the_push_fails: {
-                        assert!(push_result.is_err());
-
-                        'and_then_we_get_the_value_we_tried_to_push_back: {
-                            assert_eq!(push_result.unwrap_err(), 4);
-                        }
-                    }
-                }
-
-                'and_when_we_pop_a_value: {
-                    let value = rx.pop();
-
-                    'then_the_popped_value_is_the_first_one_that_was_pushed: {
-                        assert_eq!(value, Some(1));
-                    }
-
-                    'and_when_we_push_another_value: {
-                        let push_result = tx.push(4);
-
-                        'then_the_push_now_succeeds: {
-                            assert!(push_result.is_ok());
-                        }
-                    }
-                }
-            }
-        }
-
-        'given_a_fifo_whose_elements_do_not_impl_copy: {
-            let (tx, rx) = fifo::<String>(2);
-
-            'when_we_push_a_value: {
-                tx.push("hello".to_string()).unwrap();
-
-                'and_when_we_pop_a_value_by_ref: {
-                    let value_ref = rx.pop_ref();
-
-                    'then_the_pop_succeeds: {
-                        assert!(value_ref.is_some());
-
-                        'and_then_the_value_is_correct: {
-                            assert_eq!(value_ref.unwrap().as_str(), "hello");
-                        }
-                    }
-                }
-            }
-        }
+        let value_ref = rx.pop_ref();
+        assert!(value_ref.is_some());
+        assert_eq!(value_ref.unwrap().as_str(), "hello");
     }
 
     #[test]
     fn elements_are_dropped_when_overwritten() {
         let drop_counter = DropCounter::default();
-        let (tx, rx) = fifo(3);
+        let (tx, rx) = fifo::<_, 3>();
 
         tx.push(drop_counter.clone()).unwrap();
         tx.push(drop_counter.clone()).unwrap();
@@ -551,7 +552,7 @@ mod test {
     #[test]
     fn elements_are_dropped_when_buffer_is_dropped() {
         let drop_counter = DropCounter::default();
-        let (tx, rx) = fifo(3);
+        let (tx, rx) = fifo::<_, 3>();
 
         tx.push(drop_counter.clone()).unwrap();
         tx.push(drop_counter.clone()).unwrap();
@@ -569,30 +570,8 @@ mod test {
     }
 
     #[test]
-    fn cursors_wrap_around_and_start_at_the_allocated_capacity() {
-        const BEFORE_OVERFLOW: Tail = Cursor(usize::MAX - 1, PhantomData);
-        const OVERFLOW: Tail = Cursor(usize::MAX, PhantomData);
-
-        for capacity in (0..=1024).map(|capacity: usize| capacity.next_power_of_two()) {
-            let prev_tail = advance(BEFORE_OVERFLOW, capacity);
-            let prev_tail_index = index(prev_tail, capacity);
-
-            let next_tail = advance(OVERFLOW, capacity);
-            let next_tail_index = index(next_tail, capacity);
-
-            // The wrapped cursor should not reuse the values between [0, allocated_capacity)
-            // because they are used to determine if elements can be safely dropped.
-            assert!(
-                next_tail.0 >= capacity,
-                "the wrapped cursor should not reuse the values between [0, allocated_capacity)"
-            );
-            assert_eq!(next_tail_index, (prev_tail_index + 1) % capacity);
-        }
-    }
-
-    #[test]
     fn reading_and_writing_on_different_threads() {
-        let (writer, reader) = fifo(12);
+        let (writer, reader) = fifo::<_, 12>();
 
         #[cfg(miri)]
         const NUM_WRITES: usize = 128;

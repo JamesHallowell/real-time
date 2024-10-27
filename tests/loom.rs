@@ -77,10 +77,10 @@ fn writing_on_real_time_thread() {
 }
 
 #[test]
-fn reading_and_writing_on_different_threads() {
+fn reading_from_a_fifo_on_real_time_thread() {
     loom::model(|| {
         const NUM_WRITES: usize = 4;
-        let (writer, reader) = fifo(NUM_WRITES);
+        let (writer, reader) = fifo::<_, NUM_WRITES>();
 
         let _ = writer.push(0);
         thread::spawn({

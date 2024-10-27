@@ -12,12 +12,15 @@ crossbeam-utils = "0.8.19"
 loom = "0.7.1"
 
 [dev-dependencies]
-beady = "0.6.1"
 criterion = { version = "0.5.1", features = ["html_reports"] }
 static_assertions = "1.1.0"
 
 [[bench]]
 name = "reader"
+harness = false
+
+[[bench]]
+name = "fifo"
 harness = false
 
 [lints.rust]
