@@ -1,13 +1,14 @@
 use {
     crate::{
+        backoff::Backoff,
         sync::{
             atomic::{AtomicUsize, Ordering},
             Arc,
         },
         thread,
     },
-    crossbeam_utils::{Backoff, CachePadded},
-    std::{alloc, cmp::PartialEq, marker::PhantomData, mem, ops::Deref},
+    crossbeam_utils::CachePadded,
+    std::{alloc, cmp::PartialEq, marker::PhantomData, ops::Deref},
 };
 
 /// A handle for writing values to the FIFO.
@@ -52,8 +53,7 @@ impl<T> Producer<T> {
     ///
     /// If the FIFO is full, this method will block until there is space available.
     pub fn push_blocking(&self, mut value: T) {
-        let backoff = Backoff::new();
-
+        let backoff = Backoff::default();
         loop {
             value = match self.push(value) {
                 Ok(()) => return,
@@ -61,7 +61,7 @@ impl<T> Producer<T> {
             };
 
             if backoff.is_completed() {
-                thread::park();
+                thread::yield_now();
             } else {
                 backoff.snooze();
             }
@@ -75,12 +75,23 @@ impl<T> Producer<T> {
         let tail = self.buffer.get_tail(Ordering::Relaxed);
         let head = self.buffer.get_head(Ordering::Acquire);
 
-        if self.buffer.is_full(head, tail) {
+        let size = self.buffer.size(head, tail);
+        assert!(
+            size <= self.buffer.capacity,
+            "{} <= {}",
+            size,
+            self.buffer.capacity
+        );
+
+        let is_full = size == self.buffer.capacity;
+        if is_full {
             return Err(value);
         }
 
         let ptr = self.buffer.element(tail);
-        if usize::from(tail) >= self.buffer.allocated_capacity {
+
+        let first_time_writing_to_slot = usize::from(tail) < self.buffer.allocated_capacity;
+        if !first_time_writing_to_slot {
             unsafe { ptr.drop_in_place() };
         }
         unsafe { ptr.write(value) };
@@ -103,10 +114,11 @@ impl<T> Consumer<T> {
     ///
     /// This method is useful when the elements in the FIFO do not implement `Copy`.
     pub fn pop_ref(&self) -> Option<PopRef<'_, T>> {
-        let tail = self.buffer.get_tail(Ordering::Acquire);
         let head = self.buffer.get_head(Ordering::Relaxed);
+        let tail = self.buffer.get_tail(Ordering::Acquire);
 
-        if self.buffer.is_empty(head, tail) {
+        let is_empty = head == tail;
+        if is_empty {
             return None;
         }
 
@@ -118,98 +130,6 @@ impl<T> Consumer<T> {
             consumer: self,
         })
     }
-}
-
-impl<T> Buffer<T> {
-    fn new(capacity: usize) -> Self {
-        let layout = layout_for::<T>(capacity);
-        let buffer = unsafe { alloc::alloc(layout) };
-        if buffer.is_null() {
-            panic!("failed to allocate buffer");
-        }
-
-        Self {
-            data: buffer.cast(),
-            capacity,
-            allocated_capacity: capacity.next_power_of_two(),
-            head: CachePadded::new(AtomicUsize::new(0)),
-            tail: CachePadded::new(AtomicUsize::new(0)),
-        }
-    }
-
-    fn get_head(&self, ordering: Ordering) -> Head {
-        self.head.load(ordering).into()
-    }
-
-    fn get_tail(&self, ordering: Ordering) -> Tail {
-        self.tail.load(ordering).into()
-    }
-
-    fn increment_head(&self, head: Head, ordering: Ordering) {
-        let head = self.increment(head);
-        self.head.store(head.into(), ordering);
-    }
-
-    fn increment_tail(&self, tail: Tail, ordering: Ordering) {
-        let tail = self.increment(tail);
-        self.tail.store(tail.into(), ordering);
-    }
-
-    fn size(&self, head: Head, tail: Tail) -> usize {
-        self.index(tail).saturating_sub(self.index(head)) as usize
-    }
-
-    fn is_empty(&self, head: Head, tail: Tail) -> bool {
-        head == tail
-    }
-
-    fn is_full(&self, head: Head, tail: Tail) -> bool {
-        self.size(head, tail) == self.capacity
-    }
-
-    fn element<Role>(&self, cursor: Cursor<Role>) -> *mut T {
-        unsafe { self.data.offset(self.index(cursor)) }
-    }
-
-    fn index<Role>(&self, Cursor(cursor, _): Cursor<Role>) -> isize {
-        (cursor & (self.allocated_capacity - 1)) as isize
-    }
-
-    fn increment<Role>(&self, Cursor(cursor, _): Cursor<Role>) -> Cursor<Role> {
-        match cursor.checked_add(1) {
-            Some(cursor) => cursor,
-            None => (cursor % self.allocated_capacity) + self.allocated_capacity + 1,
-        }
-        .into()
-    }
-}
-
-impl<T> Drop for Buffer<T> {
-    fn drop(&mut self) {
-        let tail = self.get_tail(Ordering::Relaxed).into();
-        let n = if tail < self.allocated_capacity {
-            tail
-        } else {
-            self.allocated_capacity
-        };
-
-        for i in 0..n {
-            let ptr = unsafe { self.data.add(i) };
-            unsafe { ptr.drop_in_place() };
-        }
-
-        let layout = layout_for::<T>(self.capacity);
-        unsafe { alloc::dealloc(self.data.cast(), layout) };
-    }
-}
-
-fn layout_for<T>(capacity: usize) -> alloc::Layout {
-    let bytes = capacity
-        .next_power_of_two()
-        .checked_mul(mem::size_of::<T>())
-        .expect("capacity overflow");
-
-    alloc::Layout::from_size_align(bytes, mem::align_of::<T>()).expect("failed to create layout")
 }
 
 /// A reference to a value that has been popped from the FIFO.
@@ -233,6 +153,92 @@ impl<T> Drop for PopRef<'_, T> {
             .buffer
             .increment_head(self.head, Ordering::Release);
     }
+}
+
+impl<T> Buffer<T> {
+    fn new(capacity: usize) -> Self {
+        let allocated_capacity = capacity.next_power_of_two();
+
+        let layout = layout_for::<T>(allocated_capacity);
+        let buffer = unsafe { alloc::alloc(layout) };
+        if buffer.is_null() {
+            panic!("failed to allocate buffer");
+        }
+
+        Self {
+            data: buffer.cast(),
+            capacity,
+            allocated_capacity,
+            head: CachePadded::new(AtomicUsize::new(0)),
+            tail: CachePadded::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn get_head(&self, ordering: Ordering) -> Head {
+        self.head.load(ordering).into()
+    }
+
+    fn get_tail(&self, ordering: Ordering) -> Tail {
+        self.tail.load(ordering).into()
+    }
+
+    fn increment_head(&self, head: Head, ordering: Ordering) {
+        let head = self.increment(head);
+        self.head.store(head.into(), ordering);
+    }
+
+    fn increment_tail(&self, tail: Tail, ordering: Ordering) {
+        let tail = self.increment(tail);
+        self.tail.store(tail.into(), ordering);
+    }
+
+    fn size(&self, Cursor(head, _): Head, Cursor(tail, _): Tail) -> usize {
+        tail.saturating_sub(head)
+    }
+
+    fn element<Role>(&self, cursor: Cursor<Role>) -> *mut T {
+        unsafe { self.data.offset(self.index(cursor)) }
+    }
+
+    fn index<Role>(&self, Cursor(cursor, _): Cursor<Role>) -> isize {
+        (cursor & (self.allocated_capacity - 1)) as isize
+    }
+
+    fn increment<Role>(&self, Cursor(cursor, _): Cursor<Role>) -> Cursor<Role> {
+        match cursor.checked_add(1) {
+            Some(cursor) => cursor,
+            None => (cursor % self.allocated_capacity) + self.allocated_capacity + 1,
+        }
+        .into()
+    }
+}
+
+impl<T> Drop for Buffer<T> {
+    fn drop(&mut self) {
+        let tail = self.get_tail(Ordering::Relaxed).into();
+
+        let elements_to_drop = if tail < self.allocated_capacity {
+            tail
+        } else {
+            self.allocated_capacity
+        };
+
+        for i in 0..elements_to_drop {
+            let ptr = unsafe { self.data.add(i) };
+            unsafe { ptr.drop_in_place() };
+        }
+
+        let layout = layout_for::<T>(self.allocated_capacity);
+        unsafe { alloc::dealloc(self.data.cast(), layout) };
+    }
+}
+
+fn layout_for<T>(capacity: usize) -> alloc::Layout {
+    let bytes = capacity
+        .checked_mul(size_of::<T>())
+        .expect("capacity overflow");
+
+    alloc::Layout::from_size_align(bytes, align_of::<T>()).expect("failed to create layout")
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -443,6 +449,38 @@ mod test {
                 next_head_index,
                 (prev_head_index + 1) % tx.buffer.allocated_capacity as isize
             );
+        }
+    }
+
+    #[test]
+    fn reading_and_writing_on_different_threads() {
+        let (writer, reader) = fifo(12);
+
+        #[cfg(miri)]
+        const NUM_WRITES: usize = 128;
+
+        #[cfg(not(miri))]
+        const NUM_WRITES: usize = 1_000_000;
+
+        thread::spawn({
+            move || {
+                for value in 0..=NUM_WRITES {
+                    writer.push_blocking(value);
+                }
+            }
+        });
+
+        let mut last = None;
+        while last != Some(NUM_WRITES) {
+            match reader.pop() {
+                Some(value) => {
+                    if let Some(last) = last {
+                        assert_eq!(last + 1, value, "values should be popped in order");
+                    }
+                    last = Some(value);
+                }
+                None => thread::yield_now(),
+            }
         }
     }
 }
