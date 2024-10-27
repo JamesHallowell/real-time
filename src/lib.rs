@@ -13,6 +13,5 @@ pub mod fifo;
 
 mod backoff;
 mod sync;
-mod thread;
 
 type PhantomUnsync = std::marker::PhantomData<std::cell::Cell<()>>;

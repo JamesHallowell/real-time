@@ -12,4 +12,12 @@ impl Backoff {
         #[cfg(not(loom))]
         self.backoff.spin();
     }
+
+    pub fn snooze(&self) {
+        #[cfg(loom)]
+        self.spin();
+
+        #[cfg(not(loom))]
+        self.backoff.snooze();
+    }
 }
