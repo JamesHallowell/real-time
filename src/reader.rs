@@ -76,7 +76,7 @@ unsafe impl<T> Send for Shared<T> {}
 impl<T> RealtimeReader<T> {
     /// Read the shared value on the real-time thread.
     pub fn lock(&self) -> RealtimeReadGuard<'_, T> {
-        let value = self.shared.live.swap(null_mut(), Ordering::SeqCst);
+        let value = self.shared.live.swap(null_mut(), Ordering::Acquire);
         debug_assert!(!value.is_null());
 
         RealtimeReadGuard {
@@ -98,7 +98,7 @@ impl<T> Drop for RealtimeReadGuard<'_, T> {
     fn drop(&mut self) {
         self.shared
             .live
-            .store(self.value.cast_mut(), Ordering::SeqCst);
+            .store(self.value.cast_mut(), Ordering::Release);
     }
 }
 
@@ -134,7 +134,7 @@ impl<T> LockingWriter<T> {
         while self
             .shared
             .live
-            .compare_exchange_weak(old, new, Ordering::SeqCst, Ordering::Relaxed)
+            .compare_exchange_weak(old, new, Ordering::AcqRel, Ordering::Relaxed)
             .is_err()
         {
             backoff.spin();

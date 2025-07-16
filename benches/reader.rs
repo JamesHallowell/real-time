@@ -1,7 +1,7 @@
 use {
-    criterion::{black_box, criterion_group, criterion_main, Bencher, Criterion},
+    criterion::{criterion_group, criterion_main, Bencher, Criterion},
     real_time::reader,
-    std::thread,
+    std::{hint::black_box, thread},
 };
 
 fn writer(bencher: &mut Bencher) {
