@@ -75,7 +75,7 @@ unsafe impl<T> Send for Shared<T> {}
 
 impl<T> RealtimeReader<T> {
     /// Read the shared value on the real-time thread.
-    pub fn lock(&self) -> RealtimeReadGuard<'_, T> {
+    pub fn read(&self) -> RealtimeReadGuard<'_, T> {
         let value = self.shared.live.swap(null_mut(), Ordering::Acquire);
         debug_assert!(!value.is_null());
 
@@ -90,7 +90,7 @@ impl<T> RealtimeReader<T> {
     where
         T: Copy,
     {
-        *self.lock()
+        *self.read()
     }
 }
 
@@ -191,7 +191,7 @@ mod test {
 
         let mut last_value = 0;
         while !writer_thread.is_finished() {
-            let value = reader.lock();
+            let value = reader.read();
             assert!(*value >= last_value);
             assert!(*value <= NUM_WRITES);
             last_value = *value;
@@ -224,6 +224,6 @@ mod test {
 
         writer.set("hello");
 
-        assert_eq!(*reader.get_ref(), "hello");
+        assert_eq!(*reader.read(), "hello");
     }
 }
