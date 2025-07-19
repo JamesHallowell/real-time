@@ -5,7 +5,7 @@ use {
 };
 
 fn writer(bencher: &mut Bencher) {
-    let (writer, reader) = readable(0);
+    let (writer, mut reader) = readable(0);
 
     thread::spawn({
         move || loop {
@@ -18,7 +18,7 @@ fn writer(bencher: &mut Bencher) {
 }
 
 fn reader(bencher: &mut Bencher) {
-    let (writer, reader) = readable(0);
+    let (writer, mut reader) = readable(0);
 
     thread::spawn({
         move || loop {
