@@ -30,7 +30,7 @@ pub struct RealtimeReadGuard<'a, T> {
 }
 
 /// Creates a shared value that can be read on the real-time thread without blocking.
-pub fn realtime_reader<T>(value: T) -> (LockingWriter<T>, RealtimeReader<T>)
+pub fn readable<T>(value: T) -> (LockingWriter<T>, RealtimeReader<T>)
 where
     T: Send,
 {
@@ -161,7 +161,7 @@ mod test {
 
     #[test]
     fn setting_and_getting_the_shared_value() {
-        let (writer, reader) = realtime_reader(0);
+        let (writer, reader) = readable(0);
 
         assert_eq!(reader.get(), 0);
         writer.set(1);
@@ -172,7 +172,7 @@ mod test {
 
     #[test]
     fn reading_and_writing_simultaneously_from_different_threads() {
-        let (writer, reader) = realtime_reader(0);
+        let (writer, reader) = readable(0);
 
         #[cfg(miri)]
         const NUM_WRITES: usize = 10;
@@ -206,7 +206,7 @@ mod test {
         let a = Box::new(1);
         let a_addr = addr_of!(*a);
 
-        let (writer, reader) = realtime_reader(0);
+        let (writer, reader) = readable(0);
 
         let mut b = writer.swap(a);
         assert_eq!(reader.get(), 1);

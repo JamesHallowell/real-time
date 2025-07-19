@@ -15,3 +15,5 @@ mod backoff;
 mod sync;
 
 type PhantomUnsync = std::marker::PhantomData<std::cell::Cell<()>>;
+
+pub use {fifo::fifo, reader::readable, writer::writable};

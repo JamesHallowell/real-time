@@ -23,7 +23,7 @@ pub struct RealtimeWriter<T> {
 }
 
 /// Creates a shared value that can be mutated on the real-time thread without blocking.
-pub fn realtime_writer<T>(value: T) -> (LockingReader<T>, RealtimeWriter<T>)
+pub fn writable<T>(value: T) -> (RealtimeWriter<T>, LockingReader<T>)
 where
     T: Clone + Send,
 {
@@ -33,11 +33,11 @@ where
     });
 
     (
-        LockingReader {
+        RealtimeWriter {
             shared: Arc::clone(&shared),
             _marker: PhantomData,
         },
-        RealtimeWriter {
+        LockingReader {
             shared,
             _marker: PhantomData,
         },
@@ -239,7 +239,7 @@ mod test {
 
     #[test]
     fn managing_the_control_bits() {
-        let (reader, writer) = realtime_writer(0);
+        let (writer, reader) = writable(0);
         let get_controls_bits =
             |writer: &RealtimeWriter<_>| ControlBits(writer.shared.control.load(Ordering::SeqCst));
 
@@ -284,7 +284,7 @@ mod test {
 
     #[test]
     fn multiple_reads_before_new_writes_dont_read_old_data() {
-        let (reader, writer) = realtime_writer(0);
+        let (writer, reader) = writable(0);
 
         assert_eq!(reader.get(), 0);
 
@@ -301,7 +301,7 @@ mod test {
 
     #[test]
     fn reading_and_writing_simultaneously() {
-        let (reader, writer) = realtime_writer(0);
+        let (writer, reader) = writable(0);
 
         let shared_reader = Arc::new(Mutex::new(reader));
 

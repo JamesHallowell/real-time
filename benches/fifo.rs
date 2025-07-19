@@ -1,16 +1,17 @@
 use {
-    criterion::{black_box, criterion_group, criterion_main, Bencher, Criterion},
+    criterion::{criterion_group, criterion_main, Bencher, Criterion},
     real_time::fifo,
+    std::hint::black_box,
 };
 
 fn write(bencher: &mut Bencher) {
-    let (writer, _reader) = fifo::fifo::<_, 128>();
+    let (writer, _reader) = fifo::<_, 128>();
 
     bencher.iter(|| writer.push(1));
 }
 
 fn read(bencher: &mut Bencher) {
-    let (writer, reader) = fifo::fifo::<_, 128>();
+    let (writer, reader) = fifo::<_, 128>();
 
     writer.push_blocking(1);
 
@@ -20,7 +21,7 @@ fn read(bencher: &mut Bencher) {
 }
 
 fn read_empty(bencher: &mut Bencher) {
-    let (_writer, reader) = fifo::fifo::<i32, 128>();
+    let (_writer, reader) = fifo::<i32, 128>();
 
     bencher.iter(|| {
         black_box(reader.pop_ref());
@@ -28,7 +29,7 @@ fn read_empty(bencher: &mut Bencher) {
 }
 
 fn read_multi(bencher: &mut Bencher) {
-    let (writer, reader) = fifo::fifo::<_, 128>();
+    let (writer, reader) = fifo::<_, 128>();
 
     for value in 0..128 {
         writer.push_blocking(value);

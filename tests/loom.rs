@@ -1,9 +1,6 @@
 #![cfg(loom)]
 
-use {
-    loom::thread,
-    real_time::{fifo::fifo, reader::realtime_reader, writer::realtime_writer},
-};
+use loom::thread;
 
 #[derive(Copy, Clone)]
 struct Big {
@@ -29,7 +26,7 @@ impl Default for Big {
 #[test]
 fn reading_on_real_time_thread() {
     loom::model(|| {
-        let (writer, reader) = realtime_reader(Big::default());
+        let (writer, reader) = real_time::readable(Big::default());
 
         const READS: usize = 3;
         const WRITES: usize = 3;
@@ -54,7 +51,7 @@ fn reading_on_real_time_thread() {
 #[test]
 fn writing_on_real_time_thread() {
     loom::model(|| {
-        let (reader, writer) = realtime_writer(Big::default());
+        let (writer, reader) = real_time::writable(Big::default());
 
         const READS: usize = 3;
         const WRITES: usize = 3;
@@ -80,7 +77,7 @@ fn writing_on_real_time_thread() {
 fn reading_from_a_fifo_on_real_time_thread() {
     loom::model(|| {
         const NUM_WRITES: usize = 4;
-        let (writer, reader) = fifo::<_, NUM_WRITES>();
+        let (writer, reader) = real_time::fifo::<_, NUM_WRITES>();
 
         let _ = writer.push(0);
         thread::spawn({
