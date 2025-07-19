@@ -275,15 +275,15 @@ impl<T> RealtimeWriter<T> {
 mod test {
     use {
         super::*,
-        static_assertions::{assert_impl_all, assert_not_impl_all},
+        static_assertions::{assert_impl_all, assert_not_impl_any},
         std::{sync::atomic::AtomicUsize, thread},
     };
 
     assert_impl_all!(RealtimeWriter<i32>: Send);
-    assert_not_impl_all!(RealtimeWriter<i32>: Sync, Copy, Clone);
+    assert_not_impl_any!(RealtimeWriter<i32>: Sync, Copy, Clone);
 
     assert_impl_all!(LockingReader<i32>: Send);
-    assert_not_impl_all!(LockingReader<i32>: Sync, Copy, Clone);
+    assert_not_impl_any!(LockingReader<i32>: Sync, Copy, Clone);
 
     #[test]
     fn determining_the_read_and_write_indexes() {

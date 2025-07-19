@@ -29,7 +29,8 @@ pub struct RealtimeReadGuard<'a, T> {
     value: *const T,
 }
 
-/// Creates a shared value that can be read on the real-time thread without blocking.
+/// Creates a shared value that can be read on the real-time thread without
+/// blocking.
 pub fn readable<T>(value: T) -> (LockingWriter<T>, RealtimeReader<T>)
 where
     T: Send,
@@ -74,8 +75,7 @@ unsafe impl<T> Sync for Shared<T> {}
 unsafe impl<T> Send for Shared<T> {}
 
 impl<T> RealtimeReader<T> {
-    /// Read the shared value on the real-time thread.
-    pub fn read(&self) -> RealtimeReadGuard<'_, T> {
+    fn lock(&self) -> RealtimeReadGuard<'_, T> {
         let value = self.shared.live.swap(null_mut(), Ordering::Acquire);
         debug_assert!(!value.is_null());
 
@@ -85,12 +85,17 @@ impl<T> RealtimeReader<T> {
         }
     }
 
+    /// Read the shared value on the real-time thread.
+    pub fn read(&mut self) -> RealtimeReadGuard<'_, T> {
+        self.lock()
+    }
+
     /// Copy the shared value and return it.
     pub fn get(&self) -> T
     where
         T: Copy,
     {
-        *self.read()
+        *self.lock()
     }
 }
 
@@ -128,7 +133,8 @@ impl<T> LockingWriter<T> {
     {
         let new = Box::into_raw(value);
 
-        // SAFETY: Both pointers are valid and aligned as they come from calling `Box::into_raw`.
+        // SAFETY: Both pointers are valid and aligned as they come from calling
+        // `Box::into_raw`.
         let old = unsafe { self.shared.storage.get().replace(new) };
 
         let backoff = Backoff::default();
@@ -141,7 +147,8 @@ impl<T> LockingWriter<T> {
             backoff.spin();
         }
 
-        // SAFETY: No other references to `old` now exist, so we can reconstruct the box.
+        // SAFETY: No other references to `old` now exist, so we can reconstruct the
+        // box.
         unsafe { Box::from_raw(old) }
     }
 }
@@ -150,15 +157,15 @@ impl<T> LockingWriter<T> {
 mod test {
     use {
         super::*,
-        static_assertions::{assert_impl_all, assert_not_impl_all},
+        static_assertions::{assert_impl_all, assert_not_impl_any},
         std::thread,
     };
 
     assert_impl_all!(RealtimeReader<i32>: Send);
-    assert_not_impl_all!(RealtimeReader<i32>: Sync, Copy, Clone);
+    assert_not_impl_any!(RealtimeReader<i32>: Sync, Copy, Clone);
 
     assert_impl_all!(LockingWriter<i32>: Send);
-    assert_not_impl_all!(LockingWriter<i32>: Sync, Copy, Clone);
+    assert_not_impl_any!(LockingWriter<i32>: Sync, Copy, Clone);
 
     #[test]
     fn setting_and_getting_the_shared_value() {
@@ -173,7 +180,7 @@ mod test {
 
     #[test]
     fn reading_and_writing_simultaneously_from_different_threads() {
-        let (writer, reader) = readable(0);
+        let (writer, mut reader) = readable(0);
 
         #[cfg(miri)]
         const NUM_WRITES: usize = 10;
@@ -220,10 +227,10 @@ mod test {
 
     #[test]
     fn can_set_anything_convertible_to_value() {
-        let (writer, reader) = readable(String::new());
+        let (writer, reader) = readable(0_i64);
 
-        writer.set("hello");
+        writer.set(42_i16);
 
-        assert_eq!(*reader.read(), "hello");
+        assert_eq!(reader.get(), 42);
     }
 }
