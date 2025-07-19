@@ -113,11 +113,12 @@ impl<T> Deref for RealtimeReadGuard<'_, T> {
 
 impl<T> LockingWriter<T> {
     /// Set the value.
-    pub fn set(&self, value: T)
+    pub fn set<V>(&self, value: V)
     where
+        V: Into<T>,
         T: Send,
     {
-        let _ = self.swap(Box::new(value));
+        let _ = self.swap(Box::new(value.into()));
     }
 
     /// Update the value and return the previous value.
@@ -215,5 +216,14 @@ mod test {
         let c = writer.swap(b);
         assert_eq!(reader.get(), 2);
         assert_eq!(addr_of!(*c), a_addr);
+    }
+
+    #[test]
+    fn can_set_anything_convertible_to_value() {
+        let (writer, reader) = readable(String::new());
+
+        writer.set("hello");
+
+        assert_eq!(*reader.get_ref(), "hello");
     }
 }
