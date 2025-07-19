@@ -8,29 +8,39 @@
 
 ## Overview
 
-This crate provides some tools for sharing data with a real-time thread:
+This crate provides some tools for sharing data with a real-time thread.
 
-**Shared Values**
+### [`real_time::readable`]
 
-Type wrappers that can be used to share values between a real-time thread and another thread, in
-a way that is real-time safe.
+A shared value that can be read on a real-time thread.
 
-They use the same algorithms as `RealtimeObject`
-from [FAbian's Realtime Box o' Tricks](https://github.com/hogliux/farbot), that
-was [presented at Meeting C++ 2019](https://www.youtube.com/watch?v=ndeN983j_GQ).
+```rust
+fn main() {
+    let (writer, reader) = real_time::readable(SynthParameters::default());
+}
+```
 
-- [`RealtimeReader`], for reading from a shared value on a real-time thread.
-- [`RealtimeWriter`], for writing to a shared value on a real-time thread.
+### [`real_time::writable`]
 
-**FIFOs**
+A shared value that can be written to from a real-time thread.
 
-- [`fifo`], a lock-free single-producer, single-consumer FIFO that is optimised for a real-time consumer.
+```rust
+fn main() {
+    let (writer, reader) = real_time::writable(AudioPlaybackStats::default());
+}
+```
 
-[`RealtimeReader`]: https://docs.rs/real-time/latest/real_time/reader/struct.RealtimeReader.html
+### [`real_time::fifo`]
 
-[`RealtimeWriter`]: https://docs.rs/real-time/latest/real_time/writer/struct.RealtimeWriter.html
+A bounded, lock-free, single-producer, single consumer FIFO that is optimised for a real-time consumer. Values sent will
+be
+reclaimed and dropped by the producer once the real-time consumer has finished with them.
 
-[`fifo`]: https://docs.rs/real-time/latest/real_time/fifo/fn.fifo.html
+```rust
+fn main() {
+    let (producer, consumer) = real_time::fifo::<MidiMessage, 16>();
+}
+```
 
 ## Usage
 
@@ -38,8 +48,14 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-real-time = "0.6"
+real-time = "0.7"
 ```
+
+## Implementation
+
+[`real_time::readable`] and [`real_time::writable`] use the same algorithms as `RealtimeObject`
+from [FAbian's Realtime Box o' Tricks](https://github.com/hogliux/farbot), that
+was [presented at Meeting C++ 2019](https://www.youtube.com/watch?v=ndeN983j_GQ).
 
 ## License
 
@@ -57,3 +73,9 @@ at your option.
 Unless you explicitly state otherwise, any contribution intentionally submitted
 for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
 dual licensed as above, without any additional terms or conditions.
+
+[`real_time::readable`]: https://docs.rs/real-time/latest/real_time/reader/fn.readable.html
+
+[`real_time::writable`]: https://docs.rs/real-time/latest/real_time/writer/fn.writable.html
+
+[`real_time::fifo`]: https://docs.rs/real-time/latest/real_time/fifo/fn.fifo.html
