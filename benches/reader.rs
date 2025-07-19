@@ -1,11 +1,11 @@
 use {
     criterion::{criterion_group, criterion_main, Bencher, Criterion},
-    real_time::reader,
+    real_time::readable,
     std::{hint::black_box, thread},
 };
 
 fn writer(bencher: &mut Bencher) {
-    let (writer, reader) = reader::realtime_reader(0);
+    let (writer, reader) = readable(0);
 
     thread::spawn({
         move || loop {
@@ -18,7 +18,7 @@ fn writer(bencher: &mut Bencher) {
 }
 
 fn reader(bencher: &mut Bencher) {
-    let (writer, reader) = reader::realtime_reader(0);
+    let (writer, reader) = readable(0);
 
     thread::spawn({
         move || loop {
