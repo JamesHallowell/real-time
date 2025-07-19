@@ -7,6 +7,7 @@ use {
         },
         PhantomUnsync,
     },
+    crossbeam_utils::CachePadded,
     std::{cell::UnsafeCell, marker::PhantomData, mem::MaybeUninit},
 };
 
@@ -30,8 +31,8 @@ where
 {
     let shared = Arc::new(Shared {
         values: [
-            UnsafeCell::new(MaybeUninit::uninit()),
-            UnsafeCell::new(MaybeUninit::new(value)),
+            CachePadded::new(UnsafeCell::new(MaybeUninit::uninit())),
+            CachePadded::new(UnsafeCell::new(MaybeUninit::new(value))),
         ],
         control: AtomicU8::new(ControlBits::default().into()),
     });
@@ -49,7 +50,7 @@ where
 }
 
 struct Shared<T> {
-    values: [UnsafeCell<MaybeUninit<T>>; 2],
+    values: [CachePadded<UnsafeCell<MaybeUninit<T>>>; 2],
     control: AtomicU8,
 }
 
