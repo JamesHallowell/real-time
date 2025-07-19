@@ -11,7 +11,7 @@ fn write(bencher: &mut Bencher) {
 }
 
 fn read(bencher: &mut Bencher) {
-    let (writer, reader) = fifo::<_, 128>();
+    let (writer, mut reader) = fifo::<_, 128>();
 
     writer.push_blocking(1);
 
@@ -21,7 +21,7 @@ fn read(bencher: &mut Bencher) {
 }
 
 fn read_empty(bencher: &mut Bencher) {
-    let (_writer, reader) = fifo::<i32, 128>();
+    let (_writer, mut reader) = fifo::<i32, 128>();
 
     bencher.iter(|| {
         black_box(reader.pop_ref());
@@ -29,7 +29,7 @@ fn read_empty(bencher: &mut Bencher) {
 }
 
 fn read_multi(bencher: &mut Bencher) {
-    let (writer, reader) = fifo::<_, 128>();
+    let (writer, mut reader) = fifo::<_, 128>();
 
     for value in 0..128 {
         writer.push_blocking(value);
