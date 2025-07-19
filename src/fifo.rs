@@ -22,9 +22,9 @@ pub struct Consumer<T, const N: usize> {
 
 /// Create a new FIFO with the given capacity.
 ///
-/// This FIFO is optimised for a consumer running on a real-time thread. Elements are not dropped
-/// when they are popped, instead they will be dropped when they are overwritten by a later push,
-/// or when the buffer is dropped.
+/// This FIFO is optimised for a consumer running on a real-time thread.
+/// Elements are not dropped when they are popped, instead they will be dropped
+/// when they are overwritten by a later push, or when the buffer is dropped.
 pub fn fifo<T, const N: usize>() -> (Producer<T, N>, Consumer<T, N>) {
     let shared = Arc::new(Shared::new());
 
@@ -54,7 +54,8 @@ struct Buffer<T, const N: usize> {
 impl<T, const N: usize> Producer<T, N> {
     /// Push a value into the FIFO.
     ///
-    /// If the FIFO is full, this method will block until there is space available.
+    /// If the FIFO is full, this method will block until there is space
+    /// available.
     pub fn push_blocking(&self, mut value: T) {
         let backoff = Backoff::default();
 
@@ -66,7 +67,8 @@ impl<T, const N: usize> Producer<T, N> {
 
     /// Push a value into the FIFO.
     ///
-    /// If the FIFO is full, this method will not block, and instead returns the value to the caller.
+    /// If the FIFO is full, this method will not block, and instead returns the
+    /// value to the caller.
     pub fn push(&self, value: T) -> Result<(), T> {
         let tail = self.shared.get(Ordering::Relaxed);
         let head = self.shared.get_cached();
@@ -108,13 +110,18 @@ impl<T, const N: usize> Consumer<T, N> {
     where
         T: Copy,
     {
-        self.pop_ref().map(|r| *r)
+        self.pop_head_impl().map(|r| *r)
     }
 
     /// Pop a value from the FIFO by reference.
     ///
-    /// This method is useful when the elements in the FIFO do not implement `Copy`.
-    pub fn pop_ref(&self) -> Option<PopRef<'_, T, N>> {
+    /// This method is useful when the elements in the FIFO do not implement
+    /// `Copy`.
+    pub fn pop_ref(&mut self) -> Option<PopRef<'_, T, N>> {
+        self.pop_head_impl()
+    }
+
+    fn pop_head_impl(&self) -> Option<PopRef<'_, T, N>> {
         let head = self.shared.get(Ordering::Relaxed);
         let tail = self.shared.get_cached();
 
@@ -138,12 +145,8 @@ impl<T, const N: usize> Consumer<T, N> {
             return None;
         }
 
-        let element = self.shared.buffer.get(head);
-        let value = unsafe { &*element };
-
         Some(PopRef {
             head,
-            value,
             consumer: self,
         })
     }
@@ -287,7 +290,6 @@ fn layout_for<T>(size: usize) -> alloc::Layout {
 /// A reference to a value that has been popped from the FIFO.
 pub struct PopRef<'a, T, const N: usize> {
     head: Head,
-    value: &'a T,
     consumer: &'a Consumer<T, N>,
 }
 
@@ -295,7 +297,11 @@ impl<T, const N: usize> Deref for PopRef<'_, T, N> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        self.value
+        let element = self.consumer.shared.buffer.get(self.head);
+
+        // SAFETY: We have unique access to the value at head for the lifetime of this
+        // guard object. Only once it is dropped will the head cursor be advanced.
+        unsafe { &*element }
     }
 }
 
@@ -419,7 +425,17 @@ impl<Role> From<Cursor<Role>> for usize {
 
 #[cfg(test)]
 mod test {
-    use {super::*, std::thread};
+    use {
+        super::*,
+        static_assertions::{assert_impl_all, assert_not_impl_any},
+        std::thread,
+    };
+
+    assert_impl_all!(Producer<i32, 8>: Send);
+    assert_not_impl_any!(Producer<i32, 8>: Sync, Copy, Clone);
+
+    assert_impl_all!(Consumer<i32, 8>: Send);
+    assert_not_impl_any!(Consumer<i32, 8>: Sync, Copy, Clone);
 
     fn get_buffer_size<T, const N: usize>(producer: &Producer<T, N>) -> usize {
         size(
@@ -518,7 +534,7 @@ mod test {
         let push_result = tx.push(4);
         assert!(push_result.is_ok());
 
-        let (tx, rx) = fifo::<String, 2>();
+        let (tx, mut rx) = fifo::<String, 2>();
         tx.push("hello".to_string()).unwrap();
 
         let value_ref = rx.pop_ref();
@@ -529,7 +545,7 @@ mod test {
     #[test]
     fn elements_are_dropped_when_overwritten() {
         let drop_counter = DropCounter::default();
-        let (tx, rx) = fifo::<_, 3>();
+        let (tx, mut rx) = fifo::<_, 3>();
 
         tx.push(drop_counter.clone()).unwrap();
         tx.push(drop_counter.clone()).unwrap();
@@ -552,7 +568,7 @@ mod test {
     #[test]
     fn elements_are_dropped_when_buffer_is_dropped() {
         let drop_counter = DropCounter::default();
-        let (tx, rx) = fifo::<_, 3>();
+        let (tx, mut rx) = fifo::<_, 3>();
 
         tx.push(drop_counter.clone()).unwrap();
         tx.push(drop_counter.clone()).unwrap();
