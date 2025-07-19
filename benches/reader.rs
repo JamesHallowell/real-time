@@ -9,7 +9,7 @@ fn writer(bencher: &mut Bencher) {
 
     thread::spawn({
         move || loop {
-            let value = reader.lock();
+            let value = reader.read();
             black_box(*value);
         }
     });
@@ -27,7 +27,7 @@ fn reader(bencher: &mut Bencher) {
     });
 
     bencher.iter(|| {
-        let value = reader.lock();
+        let value = reader.read();
         black_box(*value);
     });
 }
