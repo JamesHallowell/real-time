@@ -48,7 +48,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-real-time = "0.7"
+real-time = "0.8"
 ```
 
 ## Implementation
