@@ -48,4 +48,4 @@ jobs:
           rustup component add rust-src --toolchain nightly-x86_64-unknown-linux-gnu
           rustup override set nightly
       - name: Test with ThreadSanitizer
-        run: RUSTFLAGS="-Z sanitizer=thread" cargo test -Z build-std --target x86_64-unknown-linux-gnu -- --test-threads 1
+        run: RUSTFLAGS="-Z sanitizer=thread" RUSTDOCFLAGS="-Z sanitizer=thread" cargo test -Z build-std --target x86_64-unknown-linux-gnu -- --test-threads 1
